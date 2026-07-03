@@ -1,6 +1,8 @@
 # pi-team
 
 <p align="center">
+  <a href="https://www.npmjs.com/package/pi-team"><img alt="npm" src="https://img.shields.io/npm/v/pi-team?style=flat-square&color=CB3837&logo=npm"></a>
+  &nbsp;
   <a href="https://github.com/Kurptas/pi-team/releases"><img alt="Version" src="https://img.shields.io/github/v/release/Kurptas/pi-team?style=flat-square&color=32CD32"></a>
   &nbsp;
   <a href="./LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-32CD32?style=flat-square"></a>

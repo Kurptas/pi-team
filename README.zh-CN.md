@@ -3,6 +3,8 @@
 <p align="center">
   <a href="https://github.com/Kurptas/pi-team/releases"><img src="https://img.shields.io/github/v/release/Kurptas/pi-team?style=flat-square&color=32CD32" alt="Release"></a>
   &nbsp;
+  <a href="https://www.npmjs.com/package/pi-team"><img src="https://img.shields.io/npm/v/pi-team?style=flat-square&color=CB3837&logo=npm" alt="npm"></a>
+  &nbsp;
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-32CD32?style=flat-square" alt="License"></a>
   &nbsp;
   <img src="https://img.shields.io/badge/node-%3E%3D22.19-6C757D?style=flat-square&logo=node.js&logoColor=white" alt="Node">
