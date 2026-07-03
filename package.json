@@ -1,0 +1,65 @@
+{
+  "name": "pi-team",
+  "version": "0.6.5",
+  "description": "A Pi extension that runs a task across multiple AI models — covering each other's blind spots, the right model for each job.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Kurptas",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Kurptas/pi-team.git"
+  },
+  "homepage": "https://github.com/Kurptas/pi-team#readme",
+  "bugs": "https://github.com/Kurptas/pi-team/issues",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "omp-extension",
+    "team",
+    "multi-agent"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "omp": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "files": [
+    "src",
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "vitest --run",
+    "test:team": "vitest --run test",
+    "typecheck": "tsc --noEmit",
+    "check:size": "node scripts/check-file-size.mjs",
+    "deploy:global": "node scripts/deploy-global-extension.mjs",
+    "check": "npm run check:size && npm run typecheck && npm run test:team"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^0.80.2",
+    "@earendil-works/pi-agent-core": "^0.80.2",
+    "@earendil-works/pi-coding-agent": "^0.80.2",
+    "@earendil-works/pi-tui": "^0.80.2",
+    "@types/node": "24.12.4",
+    "shx": "0.4.0",
+    "typescript": "5.9.3",
+    "vitest": "4.1.9"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  }
+}

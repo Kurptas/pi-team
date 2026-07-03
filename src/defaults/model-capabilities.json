@@ -1,0 +1,214 @@
+{
+    "version": 1,
+    "updatedAt": "2026-06-28",
+    "profiles": [
+        {
+            "family": "gpt-5-family",
+            "models": [
+                "0u0o-codex/gpt-5.5",
+                "openai/gpt-5",
+                "genesis/gpt-5"
+            ],
+            "aliases": [
+                "gpt-5.5",
+                "gpt-5",
+                "openai-gpt",
+                "codex-gpt",
+                "genesis-gpt"
+            ],
+            "displayName": "GPT-5 family",
+            "summary": "GPT-5 family capability profile. The concrete provider can be OpenAI or a third-party channel; channel availability is tracked by runtime health, while this profile records stable model-family strengths.",
+            "strengths": [
+                "general reasoning",
+                "agentic coding",
+                "front-end and software engineering",
+                "long-chain tool-use planning",
+                "high-quality synthesis",
+                "fact organization"
+            ],
+            "cautions": [
+                "third-party channel availability can differ from model capability",
+                "cost and latency should be observed locally"
+            ],
+            "recommendedRoles": [
+                "lead planner",
+                "synthesizer",
+                "fact extractor",
+                "code reviewer",
+                "architecture reviewer",
+                "decision drafter"
+            ],
+            "sources": [
+                "https://openai.com/index/introducing-gpt-5/",
+                "https://openai.com/index/introducing-gpt-5-for-developers/",
+                "https://openai.com/gpt-5/"
+            ]
+        },
+        {
+            "family": "claude-family",
+            "models": [
+                "ai-genesis-claude/claude-opus-4-8",
+                "ai-genesis-claude/claude-sonnet-4-6",
+                "anthropic/claude-opus-4-20250514",
+                "anthropic/claude-sonnet-4-20250514"
+            ],
+            "aliases": [
+                "claude-opus-4-8",
+                "claude-sonnet-4-6",
+                "claude-4.8",
+                "claude-4",
+                "claude-opus",
+                "claude-sonnet",
+                "anthropic-claude"
+            ],
+            "displayName": "Claude family",
+            "summary": "Claude family capability profile. The concrete provider can be Anthropic or a third-party OpenAI-compatible channel; channel availability is tracked by runtime health, while this profile records stable model-family strengths.",
+            "strengths": [
+                "agentic coding",
+                "long-context reasoning",
+                "careful code review",
+                "tool-aware implementation planning",
+                "architecture critique",
+                "high-quality prose synthesis"
+            ],
+            "cautions": [
+                "third-party Claude channel names may not match official Anthropic release names",
+                "channel availability does not guarantee Pi registry availability",
+                "cost, context, and latency should be observed through runtime health probes"
+            ],
+            "recommendedRoles": [
+                "architecture reviewer",
+                "code reviewer",
+                "risk reviewer",
+                "prompt architect",
+                "evidence checker",
+                "synthesis critic"
+            ],
+            "sources": [
+                "https://www.anthropic.com/claude",
+                "https://docs.anthropic.com/en/docs/about-claude/models"
+            ]
+        },
+        {
+            "family": "glm-family",
+            "models": [
+                "ai-glm/glm-5.2",
+                "zhipu/glm-5",
+                "zhipu/glm-4.5",
+                "genesis/glm"
+            ],
+            "aliases": [
+                "glm-5.2",
+                "glm-5",
+                "glm-4.5",
+                "zhipu-glm",
+                "genesis-glm"
+            ],
+            "displayName": "GLM family",
+            "summary": "GLM family capability profile. Official GLM-5/GLM-4.5 materials emphasize agentic engineering, coding, tool use, browsing, long context, structured output, and efficient Chinese work.",
+            "strengths": [
+                "agentic engineering",
+                "tool calling",
+                "web browsing workflows",
+                "coding",
+                "Chinese research notes",
+                "fast lightweight research"
+            ],
+            "cautions": [
+                "configured channel version may differ from official model naming",
+                "deep synthesis quality should be checked by lead on important tasks"
+            ],
+            "recommendedRoles": [
+                "source scout",
+                "web researcher",
+                "tool runner",
+                "coding assistant",
+                "lightweight analyst"
+            ],
+            "sources": [
+                "https://docs.bigmodel.cn/cn/guide/models/text/glm-5",
+                "https://docs.bigmodel.cn/cn/guide/models/text/glm-4.5"
+            ]
+        },
+        {
+            "family": "deepseek-family",
+            "models": [
+                "deepseek/deepseek-v4-flash",
+                "deepseek/deepseek-reasoner",
+                "deepseek/deepseek-chat"
+            ],
+            "aliases": [
+                "deepseek-v4-flash",
+                "deepseek-v4",
+                "deepseek-reasoner",
+                "deepseek"
+            ],
+            "displayName": "DeepSeek family",
+            "summary": "DeepSeek family capability profile. Official DeepSeek V4 preview emphasizes reasoning, Math/STEM/coding, and agentic coding; DeepSeek reasoner documentation also highlights JSON output support.",
+            "strengths": [
+                "reasoning",
+                "coding",
+                "technical review",
+                "quick fact checking",
+                "structured concise critique"
+            ],
+            "cautions": [
+                "Flash channel may trade depth for speed",
+                "function-calling support depends on the exact upstream model and channel"
+            ],
+            "recommendedRoles": [
+                "fact checker",
+                "risk reviewer",
+                "code reviewer",
+                "technical critic",
+                "consistency checker"
+            ],
+            "sources": [
+                "https://api-docs.deepseek.com/news/news260424",
+                "https://api-docs.deepseek.com/guides/reasoning_model",
+                "https://api-docs.deepseek.com/updates"
+            ]
+        },
+        {
+            "family": "qwen-family",
+            "models": [
+                "alibaba-cn/qwen3.6-plus",
+                "alibaba/qwen-plus",
+                "dashscope/qwen-plus"
+            ],
+            "aliases": [
+                "qwen3.6-plus",
+                "qwen3.6",
+                "qwen3",
+                "qwen",
+                "qwen-code",
+                "qwen-plus"
+            ],
+            "displayName": "Qwen family",
+            "summary": "Qwen family capability profile. Alibaba Qwen3 materials emphasize reasoning, instruction following, agent ability, multilingual support, long context options, and coding tooling through Qwen Code.",
+            "strengths": [
+                "Chinese synthesis",
+                "long-form writing",
+                "multilingual instruction following",
+                "agent tasks",
+                "coding workflows through Qwen Code",
+                "report drafting"
+            ],
+            "cautions": [
+                "configured channel availability can vary",
+                "final factual claims should keep explicit source references"
+            ],
+            "recommendedRoles": [
+                "synthesizer",
+                "Chinese report writer",
+                "long-context integrator",
+                "proposal drafter",
+                "backup coder"
+            ],
+            "sources": [
+                "https://help.aliyun.com/zh/pai/use-cases/deploy-fine-tune-and-evaluate-qwen3-in-quickstart/",
+                "https://help.aliyun.com/en/model-studio/qwen-code"
+            ]
+        }
+    ]
+}
