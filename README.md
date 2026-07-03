@@ -32,14 +32,14 @@ Then run `/reload` in Pi to activate it.
 
 ## Try it in one line
 
-Just tell Pi what you want, in plain language:
+The most direct way is the `/team` command, followed by your task. Or just tell Pi what you want in plain language:
 
 ```
-Review this pull request with three independent models and reconcile what they find.
+/team Review this pull request with three independent models and reconcile what they find.
 ```
 
 ```
-Put together a bull case, a bear case, and a skeptic on $NVDA, then give me the balanced view.
+Assemble a team to build a bull case, a bear case, and a skeptic on $NVDA, then give me the balanced view.
 ```
 
 That's it. Pi plans the roles, picks the models, dispatches the squad, and hands the findings back. You can watch it happen live, redirect a member that drifts, or stop the run whenever you like — you stay in command the whole way.
