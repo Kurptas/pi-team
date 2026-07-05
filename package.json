@@ -1,6 +1,6 @@
 {
   "name": "pi-team",
-  "version": "0.6.5",
+  "version": "0.6.6",
   "description": "A Pi extension that runs a task across multiple AI models — covering each other's blind spots, the right model for each job.",
   "type": "module",
   "license": "MIT",

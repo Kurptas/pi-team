@@ -34,15 +34,34 @@ export function assistantText(message: Message | undefined): string {
     return text?.type === "text" ? text.text : "";
 }
 
+/**
+ * Collect all non-radio assistant text, newest first.
+ *
+ * Earlier implementations only kept the last substantive message, which
+ * could discard detailed evidence produced earlier in the same turn when a
+ * later assistant message was shorter or JSON-only. Now ALL substantive
+ * assistant text is concatenated, separated by double newlines.
+ */
 export function finalAssistantText(messages: Message[]): string {
-    let latestAssistantText = "";
+    // Collect every substantive assistant message in chronological order.
+    // workerOutputKind filters by LINE, so a message that opens with a
+    // "RADIO:" prefix but carries a real report on following lines still
+    // counts as substantive and is kept (verbatim, radio line included).
+    const parts: string[] = [];
+    for (const message of messages) {
+        const output = assistantText(message);
+        if (!output) continue;
+        if (workerOutputKind(output) !== "substantive") continue;
+        parts.push(output);
+    }
+    if (parts.length > 0) return parts.join("\n\n");
+    // Fallback: no substantive message — preserve the latest non-empty
+    // (radio-only) text so outputKind stays "radio_only" rather than "empty".
     for (let index = messages.length - 1; index >= 0; index--) {
         const output = assistantText(messages[index]);
-        if (!output) continue;
-        if (!latestAssistantText) latestAssistantText = output;
-        if (workerOutputKind(output) === "substantive") return output;
+        if (output) return output;
     }
-    return latestAssistantText;
+    return "";
 }
 
 // ---------------------------------------------------------------------------

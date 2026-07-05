@@ -35,9 +35,17 @@ function artifactMarkdown(worker: WorkerRun): string {
 
 export async function writeWorkerArtifacts(cwd: string, runId: string, worker: WorkerRun): Promise<WorkerRun> {
     const paths = workerArtifactPaths(cwd, runId, worker.roleId);
-    await fs.promises.mkdir(path.dirname(paths.outputFile), { recursive: true });
-    await fs.promises.writeFile(paths.outputFile, `${artifactMarkdown(worker)}\n`, "utf-8");
-    const events = (worker.events ?? []) as TeamEvent[];
-    await fs.promises.writeFile(paths.eventFile, events.map((event) => JSON.stringify(event)).join("\n") + (events.length > 0 ? "\n" : ""), "utf-8");
-    return { ...worker, outputFile: paths.outputFile, eventFile: paths.eventFile };
+    try {
+        await fs.promises.mkdir(path.dirname(paths.outputFile), { recursive: true });
+        await fs.promises.writeFile(paths.outputFile, `${artifactMarkdown(worker)}\n`, "utf-8");
+        const events = (worker.events ?? []) as TeamEvent[];
+        await fs.promises.writeFile(paths.eventFile, events.map((event) => JSON.stringify(event)).join("\n") + (events.length > 0 ? "\n" : ""), "utf-8");
+        return { ...worker, outputFile: paths.outputFile, eventFile: paths.eventFile };
+    } catch {
+        // Artifacts are best-effort supplements (the WorkerRun already lives in
+        // state.json + the run log). A disk-full / permission / AV-lock failure
+        // must not kill the run or the other completed workers in this round.
+        // Return the worker without artifact paths to honestly signal no file.
+        return { ...worker };
+    }
 }

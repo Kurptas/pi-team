@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { codingThinkingLevel } from "./coding-thinking.ts";
 import { parseConfiguredModelPreference } from "./model-selector.ts";
-import type { FallbackPolicy, ModelCapabilityProfile, ModelHealthSnapshot, ModelProbeStatus, PlannedRole, TeamModel, ThinkingLevel } from "./types.ts";
+import type { FallbackPolicy, ModelHealthSnapshot, ModelProbeStatus, PlannedRole, ThinkingLevel } from "./types.ts";
 
 // ---------------------------------------------------------------------------
 // Recommendation data
@@ -198,7 +198,6 @@ export function selectModelsToProbe(
             for (const rec of recs.slice(0, 5)) {
                 if (candidates.length >= MIN_CANDIDATES) break;
                 if (added.has(rec.key)) continue;
-                const model = configured.find((m) => m.key === rec.key)!;
                 candidates.push({
                     key: rec.key,
                     source: "recommendation",

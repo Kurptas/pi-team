@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { Message, Model } from "@earendil-works/pi-ai";
-import { createAgentSession, SessionManager } from "@earendil-works/pi-coding-agent";
+import { createAgentSession } from "@earendil-works/pi-coding-agent";
 import { persistBlueprintArtifact } from "./blueprint-store.ts";
 import { validateTeamPlanGraph } from "./plan-graph.ts";
 import { initialQueue, newlySchedulableRounds, undispatchedRounds } from "./plan-schedule.ts";
@@ -18,18 +18,14 @@ import { findToolIsolationViolations, toolIsolationViolationMessage } from "./to
 import { workerSessionToolOptions } from "./runtime-compat.ts";
 import { writeWorkerArtifacts } from "./worker-artifacts.ts";
 import { evaluateWorkerStructuredOutput } from "./structured-output.ts";
-import { planFanoutDispatch } from "./fanout.ts";
 import {
     RADIO_REPORT_PREFIX,
     assistantText,
-    buildCaptainPreDelivery,
     buildFinalSummary,
     buildRunAbsorption,
     determineTeamRunOutcome,
     finalAssistantText,
     isRadioReport,
-    roleWithPriorFindings,
-    type TeamRunOutcome,
     workerExitStatus,
     workerFailureReason,
     workerOutputKind,
@@ -59,15 +55,12 @@ import {
     writeTeamState,
 } from "./control.ts";
 import type {
-    DelegationLaneState,
     FallbackPolicy,
     PlannedRole,
     PlannedRound,
     TeamEvent,
     TeamPlan,
     TeamRun,
-    TeamRunStatus,
-    WorkerOutputKind,
     WorkerRun,
     WorkerStatus,
 } from "./types.ts";
@@ -330,7 +323,6 @@ async function runWorker(
         );
     };
     const workerAbortController = new AbortController();
-    const sessionAbortSignal = workerAbortController.signal;
     const abortWorker = () => {
         if (wasAborted) return;
         wasAborted = true;
@@ -424,7 +416,10 @@ async function runWorker(
                 sessionAbortSignal.addEventListener("abort", onAbort, { once: true });
             }),
         ]);
-        sessionDisposer = () => session.dispose();
+        // Guard against double-dispose: the abort path and the finally block
+        // can both fire on an aborted worker. Wrap so session.dispose() runs at
+        // most once even if Pi's dispose is not idempotent.
+        sessionDisposer = onceDisposer(() => session.dispose());
         const activeTools = session.getActiveToolNames();
         runningWorker.activeTools = activeTools;
         runningWorker.toolIsolationViolation = toolIsolationViolationMessage(findToolIsolationViolations(activeTools, tools));
@@ -731,6 +726,11 @@ async function runWorker(
         sessionDisposer?.();
     }
 }
+// Runs a disposer at most once (called from both abort path and finally; dispose may not be idempotent).
+export function onceDisposer(dispose: () => void): () => void {
+    let disposed = false;
+    return () => { if (!disposed) { disposed = true; dispose(); } };
+}
 export async function mapWithConcurrency<TIn, TOut>(
     items: TIn[],
     concurrency: number,
@@ -777,7 +777,12 @@ export function createQueuedStateWriter(writeSnapshot: (snapshot: TeamRun) => Pr
     let stateWriteError: string | undefined;
     const cleanSnapshot = (snapshot: TeamRun): TeamRun => {
         const { stateWriteError: _stateWriteError, ...rest } = snapshot;
-        return rest;
+        // Deep-copy workers[] so queued snapshots aren't mutated by later
+        // Object.assign(runningWorker, ...) before the write flushes.
+        return {
+            ...rest,
+            workers: rest.workers?.map((w) => ({ ...w })),
+        };
     };
     return {
         queue(snapshot: TeamRun): void {

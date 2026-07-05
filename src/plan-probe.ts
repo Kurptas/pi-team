@@ -3,7 +3,6 @@
 // The revision loop (re-plan with unavailableModels) stays in index.ts so
 // the createSemanticPlan/createTeamPlan closure is not threaded through here.
 import { selectModelsToProbe, resolveProbeResults, type ConfiguredModel, type ProbeSet, type ResolvedProbeResult } from "./model-selection.ts";
-import { toTeamModels } from "./model-router.ts";
 import { probeModels, type ProbeModel } from "./prober.ts";
 import type { FallbackPolicy, ModelHealthSnapshot, PlannedRole, TeamModel, TeamPlan } from "./types.ts";
 
@@ -41,6 +40,7 @@ export async function probePlan(
     const dead = new Set<string>();
     for (const rolePlan of resolved.rolePlans) {
         for (const pref of rolePlan.failedUserPreferences) dead.add(pref);
+        for (const deg of rolePlan.degradedUserPreferences) dead.add(deg);
         for (const hard of rolePlan.hardFailedModels) dead.add(hard);
     }
     return { probeSet, modelHealth, resolved, deadBlueprintModels: [...dead] };

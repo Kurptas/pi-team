@@ -15,10 +15,11 @@ import { workerSessionToolOptions } from "../src/runtime-compat.ts";
 import { CAPABILITY_TOOL_NAMES } from "../src/tool-approval.ts";
 import { createTeamPlan } from "../src/planner.ts";
 import { buildWorkerInjection } from "../src/manual-loader.ts";
-import { createInProcessProbe, defaultInProcessProbeTimeoutMs, defaultProbeTimeoutMs } from "../src/prober.ts";
+import { createInProcessProbe, defaultInProcessProbeTimeoutMs, defaultProbeTimeoutMs, type ProbeModel } from "../src/prober.ts";
+import { probePlan } from "../src/plan-probe.ts";
 import { materializeFanoutRoles, resolveFanoutItems, resolveJsonPointer } from "../src/fanout.ts";
-import { resolveWorkerSessionManager, staleThresholdMs } from "../src/runner.ts";
-import { completionPush, decisionWindowMs, detectModelConvergence, shouldPushCompletion, teamWidgetLines } from "../src/index.ts";
+import { onceDisposer, resolveWorkerSessionManager, staleThresholdMs } from "../src/runner.ts";
+import { completionPush, decisionWindowMs, detectModelConvergence, generateRunId, shouldPushCompletion, teamWidgetLines } from "../src/index.ts";
 import { buildRunAbsorption, determineTeamRunOutcome } from "../src/run-outcome.ts";
 import { writeWorkerArtifacts } from "../src/worker-artifacts.ts";
 import { buildHandoffDigest, readHandoff, writeHandoff } from "../src/handoff.ts";
@@ -190,6 +191,44 @@ describe("reliability helpers", () => {
         const result = await writeWorkerArtifacts(dir, "run1", worker);
         expect(fs.existsSync(result.outputFile!)).toBe(true);
         expect(fs.existsSync(result.eventFile!)).toBe(true);
+    });
+
+    it("degrades to best-effort when artifact write fails (B1: does not kill the run)", async () => {
+        // Point cwd at a regular file so mkdir(cwd/.pi/team/...) fails with
+        // ENOTDIR. Artifacts are supplements; the failure must not throw and
+        // must not fabricate artifact paths that do not exist.
+        const filePath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "pi-team-artifact-fail-")), "not-a-dir");
+        fs.writeFileSync(filePath, "x");
+        const worker: WorkerRun = { roleId: "a/b", title: "A", task: "A", status: "succeeded", output: "ok", tools: ["read"], events: [{ phase: "p", message: "m" }] };
+        const result = await writeWorkerArtifacts(filePath, "run1", worker);
+        expect(result.roleId).toBe("a/b");
+        expect(result.output).toBe("ok");
+        expect(result.outputFile).toBeUndefined();
+        expect(result.eventFile).toBeUndefined();
+    });
+
+    it("onceDisposer runs the underlying dispose at most once (B2: abort + finally double-call)", () => {
+        // runWorker wires the same disposer into both abortWorker and the
+        // finally block. When a worker is aborted, both paths fire; the guard
+        // must collapse them to a single session.dispose() call.
+        let disposeCount = 0;
+        const disposer = onceDisposer(() => {
+            disposeCount += 1;
+        });
+        disposer(); // abort path
+        disposer(); // finally path
+        disposer(); // defensive extra
+        expect(disposeCount).toBe(1);
+    });
+
+    it("generateRunId produces unique ids within the same millisecond (B6: no runId collision)", () => {
+        // Two team() calls in the same ms must not share a runId, or one run's
+        // background Promise would delete the other's AbortController / inherit
+        // its canceled flag. Date.now alone is not unique; the random suffix is.
+        const ids = new Set<string>();
+        for (let i = 0; i < 1000; i++) ids.add(generateRunId());
+        expect(ids.size).toBe(1000);
+        for (const id of ids) expect(id).toMatch(/^team_[a-z0-9]+$/);
     });
 
     it("shows the latest worker RADIO report in running widget rows", () => {
@@ -660,6 +699,27 @@ describe("reliability helpers", () => {
         const resolved = resolveProbeResults(probeSet, health);
         expect(resolved.rolePlans[0]!.selectedModel).not.toBe("deepseek/deepseek-v4-flash");
         expect(resolved.rolePlans[0]!.degradedUserPreferences).toContain("deepseek/deepseek-v4-flash");
+    });
+
+    it("includes probe-degraded models in deadBlueprintModels (B3: replan must not reselect them)", async () => {
+        // A user preference that probe-degrades this round is surfaced as a
+        // degradedUserPreference. probePlan must fold those into
+        // deadBlueprintModels so the replan path does not reselect a model that
+        // just timed out / rate-limited.
+        const role = { ...modelRole(["deepseek/deepseek-v4-flash"]), roleId: "scout", title: "Scout" };
+        const plan: TeamPlan = { ...basePlan(), rounds: [{ id: "r1", type: "parallel", roles: [role] }] };
+        const cfg = configuredModels();
+        const degradedProbe: ProbeModel = async (model) => ({
+            provider: model.provider,
+            model: `${model.provider}/${model.id}`,
+            status: `${model.provider}/${model.id}` === "deepseek/deepseek-v4-flash" ? "timeout" : "probe_passed",
+            latencyMs: 1,
+            checkedAt: 1,
+        });
+        const result = await probePlan(plan, cfg, teamModels(cfg), defaultsDir, "task_first", false, degradedProbe);
+        // sanity: the degraded user preference was demoted, not selected
+        expect(result.resolved.rolePlans[0]!.degradedUserPreferences).toContain("deepseek/deepseek-v4-flash");
+        expect(result.deadBlueprintModels).toContain("deepseek/deepseek-v4-flash");
     });
 
     // ── 项3: user default model as revealed-preference candidate ──

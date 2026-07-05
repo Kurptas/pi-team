@@ -28,7 +28,6 @@ import { modelKey, routeTeamPlan, selectModelForRole } from "../src/model-router
 import { createTeamPlan, selectPlaybook } from "../src/planner.ts";
 import {
 	buildCaptainPreDelivery,
-	buildFinalSummary,
 	buildRunAbsorption,
 	createQueuedStateWriter,
 	dedupRoundRoles,
@@ -63,6 +62,10 @@ function registerTeamExtension() {
 		},
 		registerCommand(name: string, definition: any) {
 			commands.set(name, definition);
+		},
+		registerShortcut() {},
+		setModel() {
+			return Promise.resolve(true);
 		},
 		registerProvider(name: string, definition: any) {
 			providers.set(name, definition);

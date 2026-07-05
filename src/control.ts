@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { CONFIG_DIR_NAME } from "./runtime-compat.ts";
 import type { DelegationLaneState, TeamRun } from "./types.ts";
 
 export interface TeamControlPaths {
@@ -29,7 +30,7 @@ export interface TeamMailboxMessage {
 }
 
 export function teamBaseDir(cwd: string): string {
-    return path.join(cwd, ".pi", "team");
+    return path.join(cwd, CONFIG_DIR_NAME, "team");
 }
 
 export function teamRunLogDir(cwd: string): string {

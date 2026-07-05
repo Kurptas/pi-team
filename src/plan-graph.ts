@@ -1,4 +1,4 @@
-import type { PlannedRole, TeamPlan } from "./types.ts";
+import type { TeamPlan } from "./types.ts";
 
 export interface PlanGraphValidation {
     errors: string[];

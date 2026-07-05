@@ -1,9 +1,8 @@
 import { dirname, join } from "node:path";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import type { Api, Model } from "@earendil-works/pi-ai";
-import { keyHint, type ExtensionAPI, type ExtensionContext, type ExtensionUIContext, type Theme } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth, visibleWidth, type Component } from "@earendil-works/pi-tui";
+import { type ExtensionAPI, type ExtensionContext, type ExtensionUIContext, type Theme } from "@earendil-works/pi-coding-agent";
+import type { KeyId } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { promoteBlueprintArtifact } from "./blueprint-store.ts";
 import { loadModelCapabilityProfiles } from "./capabilities.ts";
@@ -11,21 +10,23 @@ import { appendTeamMessage, listTeamRunIds, prepareTeamControl, readTeamMailbox,
 import { buildHandoffDigest, readHandoff } from "./handoff.ts";
 import { loadTeamResources } from "./loader.ts";
 import { loadManual } from "./manual-loader.ts";
-import { resolveProbeResults, selectModelsToProbe } from "./model-selection.ts";
 import { probePlan } from "./plan-probe.ts";
 import { routeTeamPlan, toTeamModels } from "./model-router.ts";
 import { createTeamPlan } from "./planner.ts";
-import { createCliProbe, createInProcessProbe, probeModels } from "./prober.ts";
-import { runTeamPlan, staleThresholdMs, type TeamRunOptions } from "./runner.ts";
+import { createCliProbe, createInProcessProbe } from "./prober.ts";
+import { runTeamPlan, type TeamRunOptions } from "./runner.ts";
 import { createSemanticPlan } from "./semantic-planner.ts";
 import type { TeamEvent, TeamInput, TeamModel, TeamRun, WorkerRun, PlannedRole } from "./types.ts";
 import { clearLiveness, formatLivenessTag, recordAndDiffLiveness } from "./worker-liveness.ts";
 import { guardCancelLastWorker } from "./cancel-guard.ts";
+import { TeamParams, TeamRunParams, TeamMessageParams, TeamCancelParams, TeamPromoteBlueprintParams, TeamCancelWorkerParams } from "./tool-params.ts";
+import { buildTeamStatusProjection } from "./status-projection.ts";
+export { buildTeamStatusProjection } from "./status-projection.ts";
+import { isTerminalStatus, teamCountSummary, teamWidget, teamWidgetLines, truncatedLines, renderTeamCompact, renderPlainResult } from "./status-render.ts";
+export { teamWidgetLines } from "./status-render.ts";
 
 const baseDir = dirname(fileURLToPath(import.meta.url));
 const defaultsDir = join(baseDir, "defaults");
-// Stale threshold (PI_TEAM_STALE_THRESHOLD_MS, default 20s).
-const TEAM_STATUS_STALE_MS = staleThresholdMs();
 // Decision-window timeout (PI_TEAM_DECISION_WINDOW_MS, default 15s).
 const DEFAULT_DECISION_WINDOW_MS = 15_000;
 export function decisionWindowMs(env: NodeJS.ProcessEnv = process.env): number {
@@ -34,66 +35,6 @@ export function decisionWindowMs(env: NodeJS.ProcessEnv = process.env): number {
 }
 const TEAM_WIDGET_KEY = "pi-team-workers";
 const TEAM_STATUS_KEY = "pi-team-status";
-const TEAM_WIDGET_VISIBLE_WORKERS = 3;
-
-const TeamParams = Type.Object({
-    task: Type.String({ description: "Task for the team to complete" }),
-    playbook: Type.Optional(Type.String({ description: "Playbook id, such as etf-research or code-review" })),
-    mode: Type.Optional(Type.String({ description: "Task mode: research, roundtable, code, review, strategy" })),
-    maxAgents: Type.Optional(Type.Number({ description: "Maximum number of worker roles to run" })),
-    probeModels: Type.Optional(Type.Boolean({ description: "Run live model probes before dispatch. Default: true" })),
-    outputContract: Type.Optional(Type.String({ description: "Output contract hint" })),
-    fallbackPolicy: Type.Optional(
-        Type.Union([
-            Type.Literal("task_first"),
-            Type.Literal("strict"),
-            Type.Literal("cheap_only"),
-        ], { description: "Model fallback behavior: task_first (default), strict (do not auto-fallback beyond explicit/recommended candidates), or cheap_only (fallback only to low-cost/fast models)." }),
-    ),
-    roles: Type.Optional(
-        Type.Array(
-            Type.Object({
-                id: Type.Optional(Type.String({ description: "Stable role id for generated playbooks" })),
-                title: Type.String({ description: "Task-specific role title" }),
-                capability: Type.Optional(Type.String({ description: "Role capability profile" })),
-                capabilityNeeds: Type.Optional(
-                    Type.Array(Type.String({ description: "Capability tags needed by this role" })),
-                ),
-                description: Type.Optional(Type.String({ description: "Role responsibility and boundary" })),
-                systemPrompt: Type.Optional(Type.String({ description: "Role-specific system prompt" })),
-                tools: Type.Optional(Type.Array(Type.String({ description: "Tools this role should use" }))),
-                modelFit: Type.Optional(Type.String({ description: "What model qualities fit this role" })),
-                thinking: Type.Optional(
-                    Type.Union([
-                        Type.Literal("off"),
-                        Type.Literal("minimal"),
-                        Type.Literal("low"),
-                        Type.Literal("medium"),
-                        Type.Literal("high"),
-                        Type.Literal("xhigh"),
-                    ], { description: "Explicit thinking level for this role. You can also append it to a model preference, e.g. provider/model:high." }),
-                ),
-                modelPreferences: Type.Optional(
-                    Type.Array(Type.String({ description: "Preferred provider/model keys; may include :thinking suffix, e.g. provider/model:high" })),
-                ),
-                dependsOn: Type.Optional(
-                    Type.Array(Type.String({ description: "Role ids that must finish before this role starts" })),
-                ),
-                reportsTo: Type.Optional(
-                    Type.Array(Type.String({ description: "Role ids that should run after this role" })),
-                ),
-                sop: Type.Optional(
-                    Type.Array(Type.String({ description: "SOP ids to inject into this worker's system prompt (e.g. [\"code-review\", \"research\"]). Files live in defaults/manuals/sop/<id>.md." })),
-                ),
-                resumable: Type.Optional(Type.Boolean({ description: "When true, this role's worker session persists to disk and the SAME roleId in a later round resumes with full prior context instead of starting fresh. Default false (in-memory, wiped after the run). Opt-in for multi-round 'same teammate continues' work." })),
-            }),
-            { description: "Task-specific roles designed by the lead agent when built-in playbooks are too generic" },
-        ),
-    ),
-    background: Type.Optional(
-        Type.Boolean({ description: "Run the team in the background. Default: true. When true, team returns immediately with a runId so the captain can observe with team_status and control with team_message/team_cancel_worker. When false, blocks until the team finishes (ESC cancels the run)." }),
-    ),
-});
 
 const backgroundRunControllers = new Map<string, AbortController>();
 // Runs the captain explicitly canceled. Their background Promise still settles
@@ -101,33 +42,23 @@ const backgroundRunControllers = new Map<string, AbortController>();
 // Observed runs: captain polled via team_status, no push unless failed.
 const captainCanceledRuns = new Set<string>();
 const observedRuns = new Set<string>();
-
-const TeamRunParams = Type.Object({
-    runId: Type.Optional(Type.String({ description: "Team run id. Defaults to the latest known run." })),
-});
-
-const TeamMessageParams = Type.Object({
-    runId: Type.Optional(Type.String({ description: "Team run id. Defaults to the latest known run." })),
-    message: Type.String({ description: "Captain message for active workers" }),
-});
-
-const TeamCancelParams = Type.Object({
-    runId: Type.Optional(Type.String({ description: "Team run id. Defaults to the latest known run." })),
-    reason: Type.Optional(Type.String({ description: "Reason shown in the cancel marker" })),
-});
-
-const TeamPromoteBlueprintParams = Type.Object({
-    blueprintId: Type.Optional(Type.String({ description: "Generated blueprint id. Defaults to the run blueprint id." })),
-    runId: Type.Optional(Type.String({ description: "Team run id to read blueprint id from when blueprintId is omitted." })),
-    captainNote: Type.String({ description: "Captain judgment for why this generated blueprint is worth reusing." }),
-});
-
-const TeamCancelWorkerParams = Type.Object({
-    runId: Type.Optional(Type.String({ description: "Team run id. Defaults to the latest known run." })),
-    roleId: Type.String({ description: "Worker role id to cancel." }),
-    reason: Type.Optional(Type.String({ description: "Reason for canceling this specific worker." })),
-    confirm: Type.Optional(Type.Boolean({ description: "Required (true) to cancel the LAST running worker — ends all live execution, no new evidence this round. Not needed when other workers remain." })),
-});
+// (2026-07-05 B4) Timestamp each background run so we can reap module-level
+// state if its Promise never settles (model API deadlock, hung session,
+// orphaned process). Normal cleanup still happens in .then()/.catch(); this is
+// a bounded-memory backstop only. Entries older than the reap horizon (well past
+// the 1h runaway ceiling) are dropped when the next run starts.
+const backgroundRunStartedAt = new Map<string, number>();
+const STALE_RUN_REAP_MS = 2 * 60 * 60 * 1000;
+function reapStaleRunState(now: number): void {
+    for (const [runId, startedAt] of backgroundRunStartedAt) {
+        if (now - startedAt < STALE_RUN_REAP_MS) continue;
+        backgroundRunControllers.delete(runId);
+        captainCanceledRuns.delete(runId);
+        observedRuns.delete(runId);
+        clearLiveness(runId);
+        backgroundRunStartedAt.delete(runId);
+    }
+}
 
 function teamInstruction(task: string): string {
     return [
@@ -143,9 +74,17 @@ function teamInstruction(task: string): string {
 import { completionPush, detectModelConvergence, shouldPushCompletion } from "./notify-gating.ts";
 export { completionPush, detectModelConvergence, shouldPushCompletion } from "./notify-gating.ts";
 
+// (2026-07-05 B6) Collision-resistant run id: Date.now alone is not unique for
+// two team() calls in the same millisecond. A collision would let one run's
+// background Promise delete the other's AbortController (un-abortable) or
+// inherit its canceled flag. Append a short random suffix. Exported for tests.
+export function generateRunId(): string {
+    return `team_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+}
+
 function makeRun(task: string, playbookId: string, fallbackPolicy?: TeamInput["fallbackPolicy"]): TeamRun {
     return {
-        runId: `team_${Date.now().toString(36)}`,
+        runId: generateRunId(),
         task,
         playbookId,
         fallbackPolicy,
@@ -173,198 +112,13 @@ export function refreshTeamModelRegistry(ctx: Pick<ExtensionContext, "modelRegis
     ctx.modelRegistry.refresh();
 }
 
-function secondsSince(timestamp: number | undefined, now: number): number | undefined {
-    return timestamp === undefined ? undefined : Math.max(0, Math.round((now - timestamp) / 1000));
-}
 
-function workerActivity(worker: WorkerRun): string {
-    if (worker.lastTool) return `tool:${worker.lastTool}`;
-    return worker.lastEvent ?? "starting";
-}
-
-export function buildTeamStatusProjection(
-    run: TeamRun,
-    mailboxMessages: { at: number; message: string }[],
-    now = Date.now(),
-) {
-    const workers = (run.workers ?? []).map((worker) => {
-        const signalAgeMs = worker.lastSignalAt === undefined ? undefined : Math.max(0, now - worker.lastSignalAt);
-        const signalAgeSeconds = secondsSince(worker.lastSignalAt, now);
-        const stale = worker.status === "running" && signalAgeMs !== undefined && signalAgeMs > TEAM_STATUS_STALE_MS;
-        return {
-            roleId: worker.roleId,
-            title: worker.title,
-            model: worker.model,
-            thinkingLevel: worker.thinkingLevel,
-            status: worker.status,
-            elapsedSeconds:
-                worker.startedAt === undefined
-                    ? undefined
-                    : Math.max(0, Math.round(((worker.endedAt ?? now) - worker.startedAt) / 1000)),
-            signalAgeSeconds,
-            stale,
-            activity: workerActivity(worker),
-            outputKind: worker.outputKind,
-            timedOut: worker.timedOut === true,
-            streamParseErrorCount: worker.streamParseErrorCount ?? 0,
-            lastReportPreview: worker.lastReportPreview,
-            lastCaptainMessagePreview: worker.lastCaptainMessagePreview,
-            eventCount: worker.events?.length ?? 0,
-            exitCode: worker.exitCode,
-            exitSignal: worker.exitSignal,
-            cancelRequestedAt: worker.cancelRequestedAt,
-            cancelObservedAt: worker.cancelObservedAt,
-            tools: worker.tools,
-            activeTools: worker.activeTools,
-            toolIsolationViolation: worker.toolIsolationViolation,
-            requests: worker.requests ?? 0,
-            tokens: worker.tokens ?? 0,
-            costUsd: worker.costUsd ?? 0,
-            errorReason: worker.errorReason,
-            laneId: worker.laneId,
-            delegationToken: worker.delegationToken,
-        };
-    });
-    const activeWorkers = workers.filter((worker) => worker.status === "running");
-    const evidenceWarnings = (run.events ?? [])
-        .filter((event) => event.phase === "run-evidence-warning")
-        .map((event) => event.message);
-    return {
-        runId: run.runId,
-        status: run.status,
-        playbookId: run.playbookId,
-        counts: {
-            total: workers.length,
-            active: activeWorkers.length,
-            succeeded: workers.filter((worker) => worker.status === "succeeded").length,
-            failed: workers.filter((worker) => worker.status === "failed").length,
-            skipped: workers.filter((worker) => worker.status === "skipped").length,
-            stale: workers.filter((worker) => worker.stale).length,
-            timedOut: workers.filter((worker) => worker.timedOut).length,
-            parseErrors: workers.reduce((sum, worker) => sum + worker.streamParseErrorCount, 0),
-            toolViolations: workers.filter((worker) => !!worker.toolIsolationViolation).length,
-            requests: workers.reduce((sum, worker) => sum + worker.requests, 0),
-            tokens: workers.reduce((sum, worker) => sum + worker.tokens, 0),
-            costUsd: workers.reduce((sum, worker) => sum + worker.costUsd, 0),
-        },
-        mailbox: {
-            file: run.mailboxFile,
-            textFile: run.mailboxTextFile,
-            messages: mailboxMessages.length,
-            lastMessagePreview: mailboxMessages.at(-1)?.message,
-        },
-        cancelFile: run.cancelFile,
-        evidenceWarnings,
-        workers,
-        modelHealth: (run.modelHealth ?? []).map((snapshot) => ({
-            model: snapshot.model,
-            status: snapshot.status,
-            reason: snapshot.reason,
-            latencyMs: snapshot.latencyMs,
-        })),
-        controls: run.status === "running" ? ["team_message", "team_cancel"] : [],
-        stateWriteError: run.stateWriteError,
-    };
-}
-
-type TeamStatusProjection = ReturnType<typeof buildTeamStatusProjection>;
-type ProjectedWorker = TeamStatusProjection["workers"][number];
 type TeamToolUpdate = Parameters<Parameters<ExtensionAPI["registerTool"]>[0]["execute"]>[3];
 
 let sessionUi: ExtensionUIContext | undefined;
 let sessionMode: ExtensionContext["mode"] | undefined;
 const activeTeamRunIds = new Set<string>();
 
-function isTerminalStatus(status: TeamRun["status"]): boolean {
-    return status === "succeeded" || status === "degraded" || status === "failed";
-}
-
-function durationLabel(seconds: number | undefined): string {
-    if (seconds === undefined) return "--";
-    if (seconds < 60) return `${seconds}s`;
-    return `${Math.floor(seconds / 60)}m${seconds % 60}s`;
-}
-
-function statusGlyph(worker: Pick<ProjectedWorker, "status" | "stale">): { glyph: string; color: "accent" | "success" | "error" | "warning" | "dim" | "muted" } {
-    if (worker.stale) return { glyph: "◌", color: "dim" };
-    if (worker.status === "running") return { glyph: "●", color: "accent" };
-    if (worker.status === "succeeded") return { glyph: "✓", color: "success" };
-    if (worker.status === "failed") return { glyph: "✗", color: "error" };
-    if (worker.status === "skipped") return { glyph: "⊘", color: "muted" };
-    return { glyph: "•", color: "warning" };
-}
-
-function fitVisible(text: string, width: number): string {
-    return truncateToWidth(text, width, "…");
-}
-
-function padVisible(text: string, width: number): string {
-    return `${fitVisible(text, width)}${" ".repeat(Math.max(0, width - visibleWidth(fitVisible(text, width))))}`;
-}
-
-function compactModelName(model: string | undefined): string {
-    if (!model) return "unassigned";
-    return model.split("/").at(-1) ?? model;
-}
-
-function compactModelThinking(worker: ProjectedWorker, width: number): string {
-    const suffix = worker.thinkingLevel ? `:${worker.thinkingLevel}` : "";
-    return `${fitVisible(compactModelName(worker.model), Math.max(1, width - visibleWidth(suffix)))}${suffix}`;
-}
-
-function workerCompactLine(worker: ProjectedWorker, theme: Theme): string {
-    const glyph = statusGlyph(worker);
-    const title = padVisible(worker.title, 18);
-    const model = padVisible(compactModelThinking(worker, 16), 16);
-    const signal = worker.status === "running" ? `·${durationLabel(worker.signalAgeSeconds)}` : "";
-    const exit = worker.status === "failed" ? ` exit:${worker.exitCode ?? "?"}` : "";
-    const activity = worker.status === "running" && worker.activity ? ` ${worker.activity.replace(/^tool:/, "")}` : "";
-    const report = worker.status === "running" && worker.lastReportPreview ? ` report:${fitVisible(worker.lastReportPreview, 48)}` : "";
-    return `${theme.fg(glyph.color, glyph.glyph)} ${title} ${theme.fg("dim", model)} ${durationLabel(worker.elapsedSeconds)} ${theme.fg("dim", signal)}${theme.fg(worker.status === "failed" ? "error" : "dim", `${exit}${activity}${report}`)}`.trimEnd();
-}
-
-function teamCountSummary(run: TeamRun, theme?: Theme): string {
-    const projection = buildTeamStatusProjection(run, []);
-    const { counts } = projection;
-    const paint = (color: "accent" | "success" | "error" | "warning" | "muted" | "dim", text: string) =>
-        theme ? theme.fg(color, text) : text;
-    const parts = [
-        `${counts.total} workers`,
-        `${paint("success", "✓")} ${counts.succeeded}`,
-        `${paint("accent", "●")} ${counts.active}`,
-        `${paint("error", "✗")} ${counts.failed}`,
-    ];
-    if (counts.skipped) parts.push(`${paint("muted", "⊘")} ${counts.skipped}`);
-    if (counts.stale) parts.push(`${paint("warning", "stale")} ${counts.stale}`);
-    return parts.join(" · ");
-}
-
-function compactTeamLine(run: TeamRun, theme: Theme): string {
-    const statusColor = run.status === "failed" ? "error" : run.status === "degraded" ? "warning" : isTerminalStatus(run.status) ? "success" : "accent";
-    return `${theme.fg("toolTitle", theme.bold("team"))} ${theme.fg(statusColor, run.status)} ${theme.fg("dim", run.playbookId)} · ${teamCountSummary(run, theme)}`;
-}
-
-function truncatedLines(lines: string[]): Component {
-    return {
-        render(width: number) {
-            return lines.map((line) => truncateToWidth(line, Math.max(1, width), "…"));
-        },
-        invalidate() {},
-    };
-}
-
-export function teamWidgetLines(run: TeamRun, theme: Theme): string[] {
-    const projection = buildTeamStatusProjection(run, []);
-    const shown = projection.workers.slice(0, TEAM_WIDGET_VISIBLE_WORKERS);
-    const more = Math.max(0, projection.workers.length - shown.length);
-    const lines = [compactTeamLine(run, theme), ...shown.map((worker) => workerCompactLine(worker, theme))];
-    if (more > 0) lines.push(theme.fg("dim", `… ${more} more worker(s)`));
-    return lines;
-}
-
-function teamWidget(run: TeamRun, theme: Theme): Component {
-    return truncatedLines(teamWidgetLines(run, theme));
-}
 
 function teamWidgetKey(runId: string): string {
     return `${TEAM_WIDGET_KEY}:${runId}`;
@@ -412,27 +166,6 @@ function teamUpdateSink(onUpdate: TeamToolUpdate | undefined, ctx?: Pick<Extensi
     };
 }
 
-function renderTeamDetails(run: TeamRun, theme: Theme): Component {
-    const projection = buildTeamStatusProjection(run, []);
-    const lines = [compactTeamLine(run, theme)];
-    for (const worker of projection.workers) {
-        const output = worker.outputKind ? ` output:${worker.outputKind}` : "";
-        const report = worker.lastReportPreview ? ` report:${worker.lastReportPreview}` : "";
-        const error = worker.errorReason ? ` error:${worker.errorReason}` : "";
-        lines.push(`${workerCompactLine(worker, theme)}${output}${report}${error}`);
-    }
-    return truncatedLines(lines);
-}
-
-function renderTeamCompact(run: TeamRun, options: { expanded: boolean; isPartial: boolean }, theme: Theme): Component {
-    if (options.expanded) return renderTeamDetails(run, theme);
-    const hint = options.isPartial ? "" : ` ${theme.fg("muted", `(${keyHint("app.tools.expand", "to expand")})`)}`;
-    return truncatedLines([`${compactTeamLine(run, theme)}${hint}`]);
-}
-
-function renderPlainResult(text: string): Component {
-    return truncatedLines(text.split("\n"));
-}
 
 function logUpdate(
     onUpdate: Parameters<Parameters<ExtensionAPI["registerTool"]>[0]["execute"]>[3],
@@ -464,6 +197,29 @@ export default function teamExtension(pi: ExtensionAPI) {
             pi.sendUserMessage(teamInstruction(task));
         },
     });
+
+    // ── 手动挡：一键切模型 ──
+    // Ctrl+1~4 直连常用模型，替代 Ctrl+P 翻页
+    const QUICK_MODELS: { key: KeyId; provider: string; modelId: string; label: string }[] = [
+        { key: "alt+1", provider: "ai-genesis-claude", modelId: "claude-opus-4-8", label: "Claude Opus 4.8" },
+        { key: "alt+2", provider: "openai-codex", modelId: "gpt-5.5", label: "GPT 5.5" },
+        { key: "alt+3", provider: "deepseek", modelId: "deepseek-v4-pro", label: "DeepSeek V4 Pro" },
+        { key: "alt+4", provider: "deepseek", modelId: "deepseek-v4-flash", label: "DeepSeek Flash" },
+    ];
+    for (const qm of QUICK_MODELS) {
+        pi.registerShortcut(qm.key, {
+            description: `Switch model to ${qm.label}`,
+            handler: async (ctx) => {
+                const model = ctx.modelRegistry?.find(qm.provider, qm.modelId);
+                if (!model) {
+                    ctx.ui.notify(`${qm.label}: model not found`, "warning");
+                    return;
+                }
+                const ok = await pi.setModel(model);
+                ctx.ui.notify(ok ? `→ ${qm.label}` : `${qm.label}: no API key`, ok ? "info" : "warning");
+            },
+        });
+    }
 
     pi.on("session_start", async (_event, ctx) => {
         sessionUi = ctx.hasUI ? ctx.ui : undefined;
@@ -693,11 +449,14 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
                 await writeTeamState(ctx.cwd, prepared);
                 const runController = new AbortController();
                 backgroundRunControllers.set(run.runId, runController);
+                backgroundRunStartedAt.set(run.runId, Date.now());
+                reapStaleRunState(Date.now());
                 const detachedRun = { ...prepared, workers: [] as WorkerRun[] };
                 const backgroundUpdate = teamUpdateSink(undefined);
                 runTeamPlan(ctx.cwd, routedPlan, detachedRun, { inheritedTools, modelRegistry: ctx.modelRegistry, pendingModelDecision, defaultsDir }, runController.signal, backgroundUpdate)
                     .then(async (finalRun) => {
                         backgroundRunControllers.delete(run.runId);
+                        backgroundRunStartedAt.delete(run.runId);
                         const wasCanceled = captainCanceledRuns.has(run.runId);
                         if (wasCanceled) captainCanceledRuns.delete(run.runId);
                         clearTeamUi(finalRun.runId);
@@ -716,6 +475,7 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
                     })
                     .catch(async (error) => {
                         backgroundRunControllers.delete(run.runId);
+                        backgroundRunStartedAt.delete(run.runId);
                         const wasCanceled = captainCanceledRuns.has(run.runId);
                         if (wasCanceled) captainCanceledRuns.delete(run.runId);
                         const errorRun: TeamRun = {
