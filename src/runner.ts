@@ -629,7 +629,7 @@ async function runWorker(
         // undefined) to satisfy exactOptionalPropertyTypes when spread below.
         const structured = evaluateWorkerStructuredOutput(role.outputSchema, output);
         const exitCode = wasAborted ? 130 : 0;
-        const status: WorkerStatus = runningWorker.budgetExceeded ? "failed" : workerExitStatus(exitCode, output, wasAborted, timedOut);
+        const status: WorkerStatus = runningWorker.budgetExceeded ? "degraded" : workerExitStatus(exitCode, output, wasAborted, timedOut);
         return {
             roleId: role.roleId,
             title: role.title,
@@ -678,7 +678,7 @@ async function runWorker(
         const caughtOutput = salvageOutput(runningWorker);
         const caughtOutputKind = workerOutputKind(caughtOutput);
         const caughtStructured = evaluateWorkerStructuredOutput(role.outputSchema, caughtOutput);
-        const caughtStatus: WorkerStatus = runningWorker.budgetExceeded ? "failed" : workerExitStatus(wasAborted ? 130 : 1, caughtOutput, wasAborted, timedOut);
+        const caughtStatus: WorkerStatus = runningWorker.budgetExceeded ? "degraded" : workerExitStatus(wasAborted ? 130 : 1, caughtOutput, wasAborted, timedOut);
         return {
             roleId: role.roleId,
             title: role.title,
@@ -1143,7 +1143,7 @@ export async function runTeamPlan(
             // (they depend on its output). MAJOR#1 fix: seed after EVERY round so
             // newly unblocked rounds enqueue immediately instead of waiting for the
             // whole queue to drain (data-dependency-driven, not wave-serialized).
-            for (const w of workers) if (w.status === "succeeded") completedRoleIds.add(w.roleId);
+            for (const w of workers) if (w.status === "succeeded" || (w.status === "degraded" && w.outputKind === "substantive")) completedRoleIds.add(w.roleId);
             if (plan.blockedBy) seedQueue();
         } else if (activeWorkers.size > 0) await new Promise((r) => setTimeout(r, CAPTAIN_MESSAGE_POLL_MS));
     }

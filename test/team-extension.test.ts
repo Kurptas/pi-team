@@ -1226,7 +1226,7 @@ describe("team extension", () => {
 		expect(content?.type).toBe("text");
 		if (content?.type !== "text") throw new Error("expected text content");
 		expect(content.text).toContain("state write: failed to write team state: disk full");
-		expect(content.text).toContain("workers: total:0 active:0 succeeded:0 failed:0 skipped:0 stale:0");
+		expect(content.text).toContain("workers: total:0 active:0 succeeded:0 failed:0 degraded:0 skipped:0 stale:0");
 		expect((status.details as TeamRun).stateWriteError).toBe("failed to write team state: disk full");
 		expect((status.details as any).statusProjection.stateWriteError).toBe("failed to write team state: disk full");
 	});

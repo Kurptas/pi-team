@@ -37,6 +37,7 @@ export function buildHandoffDigest(run: TeamRun): string {
         total: workers.length,
         succeeded: workers.filter((w) => w.status === "succeeded").length,
         failed: workers.filter((w) => w.status === "failed").length,
+        degraded: workers.filter((w) => w.status === "degraded").length,
         skipped: workers.filter((w) => w.status === "skipped").length,
     };
     const warnings = [
@@ -59,7 +60,7 @@ export function buildHandoffDigest(run: TeamRun): string {
         "## Workers",
         "",
         counts.total > 0
-            ? `Counts: total:${counts.total} succeeded:${counts.succeeded} failed:${counts.failed} skipped:${counts.skipped}`
+            ? `Counts: total:${counts.total} succeeded:${counts.succeeded} failed:${counts.failed} degraded:${counts.degraded} skipped:${counts.skipped}`
             : "(no workers recorded)",
         "",
         ...workers.map(workerLine),

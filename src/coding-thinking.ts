@@ -11,16 +11,35 @@ import type { ThinkingLevel } from "./types.ts";
  * - qwen3.6-plus: medium
  * - glm-5.2: medium
  * - deepseek-v4-flash: off (flash models don't need thinking overhead)
+ *
+ * For review/analysis tasks, every model is bumped one tier: flash→medium, pro→high.
  */
-export function codingThinkingLevel(modelKey: string): ThinkingLevel | undefined {
+export function taskThinkingLevel(modelKey: string, mode: "coding" | "review"): ThinkingLevel | undefined {
     const lower = modelKey.toLowerCase();
 
-    if (lower.includes("deepseek-v4-flash")) return "off";
-    if (lower.includes("deepseek-v4-pro") && !lower.includes("flash")) return "medium";
+    if (mode === "coding") {
+        if (lower.includes("deepseek-v4-flash")) return "off";
+        if (lower.includes("deepseek-v4-pro") && !lower.includes("flash")) return "medium";
+        if (lower.includes("claude-opus-4-7") || lower.includes("claude-opus-4-8")) return "high";
+        if (/(?:^|\/)gpt-5\.[45](?!-)/i.test(lower)) return "medium";
+        if (lower.includes("qwen3.6-plus")) return "medium";
+        if (lower.includes("glm-5.2")) return "medium";
+        return undefined;
+    }
+
+    // Review/analysis: bump one tier relative to coding baseline
+    if (lower.includes("deepseek-v4-flash")) return "medium";
+    if (lower.includes("deepseek-v4-pro") && !lower.includes("flash")) return "high";
     if (lower.includes("claude-opus-4-7") || lower.includes("claude-opus-4-8")) return "high";
-    if (/(?:^|\/)gpt-5\.[45](?!-)/i.test(lower)) return "medium";
+    if (/(?:^|\/)gpt-5\.[45](?!-)/i.test(lower)) return "high";
     if (lower.includes("qwen3.6-plus")) return "medium";
     if (lower.includes("glm-5.2")) return "medium";
-
     return undefined;
+}
+
+/**
+ * @deprecated Use taskThinkingLevel(modelKey, "coding") instead.
+ */
+export function codingThinkingLevel(modelKey: string): ThinkingLevel | undefined {
+    return taskThinkingLevel(modelKey, "coding");
 }

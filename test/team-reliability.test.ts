@@ -7,7 +7,7 @@ import type { Message } from "@earendil-works/pi-ai";
 import { loadTeamResources } from "../src/loader.ts";
 import { isThinkingLevel, parseConfiguredModelPreference, parseModelPreference } from "../src/model-selector.ts";
 import { resolveProbeResults, selectModelsToProbe, type ConfiguredModel } from "../src/model-selection.ts";
-import { codingThinkingLevel } from "../src/coding-thinking.ts";
+import { codingThinkingLevel, taskThinkingLevel } from "../src/coding-thinking.ts";
 import { routeTeamPlan } from "../src/model-router.ts";
 import { validateTeamPlanGraph } from "../src/plan-graph.ts";
 import { findToolIsolationViolations, toolIsolationViolationMessage } from "../src/tool-isolation.ts";
@@ -847,6 +847,104 @@ describe("reliability helpers", () => {
     });
 });
 
+describe("task thinking level — review mode", () => {
+    it("taskThinkingLevel review mode returns per-model levels (bumped from coding)", () => {
+        // Review/analysis: flash→medium, pro→high (one tier above coding)
+        expect(taskThinkingLevel("deepseek/deepseek-v4-pro", "review")).toBe("high");
+        expect(taskThinkingLevel("deepseek/deepseek-v4-flash", "review")).toBe("medium");
+        expect(taskThinkingLevel("ai-genesis-claude/claude-opus-4-7", "review")).toBe("high");
+        expect(taskThinkingLevel("ai-genesis-claude/claude-opus-4-8", "review")).toBe("high");
+        expect(taskThinkingLevel("openai-codex/gpt-5.4", "review")).toBe("high");
+        expect(taskThinkingLevel("openai-codex/gpt-5.5", "review")).toBe("high");
+        expect(taskThinkingLevel("unknown/model-123", "review")).toBeUndefined();
+        expect(taskThinkingLevel("deepseek/deepseek-v4-pro", "coding")).toBe("medium"); // coding unchanged
+    });
+
+    it("createTeamPlan mode=review sets thinking high, mode=research leaves undefined", () => {
+        const resources = loadTeamResources(projectRoot, defaultsDir);
+        const reviewPlan = createTeamPlan({
+            task: "review test",
+            mode: "review",
+            roles: [{ title: "Reviewer", tools: ["read"] }],
+        }, resources);
+        const reviewRole = reviewPlan.rounds.flatMap(r => r.roles)[0];
+        expect(reviewRole?.thinkingLevel).toBe("high");
+
+        const researchPlan = createTeamPlan({
+            task: "research test",
+            mode: "research",
+            roles: [{ title: "Researcher", tools: ["read"] }],
+        }, resources);
+        const researchRole = researchPlan.rounds.flatMap(r => r.roles)[0];
+        expect(researchRole?.thinkingLevel).toBeUndefined();
+    });
+
+    it("createTeamPlan mode=review with explicit thinking:off keeps off", () => {
+        const resources = loadTeamResources(projectRoot, defaultsDir);
+        const plan = createTeamPlan({
+            task: "review test",
+            mode: "review",
+            roles: [{ title: "Reviewer", tools: ["read"], thinking: "off" }],
+        }, resources);
+        const role = plan.rounds.flatMap(r => r.roles)[0];
+        expect(role?.thinkingLevel).toBe("off");
+    });
+
+    it("createTeamPlan default tools are [read,write,bash] when not specified", () => {
+        const resources = loadTeamResources(projectRoot, defaultsDir);
+        const plan = createTeamPlan({
+            task: "default tools test",
+            roles: [{ title: "Analyst" }],
+        }, resources);
+        const role = plan.rounds.flatMap(r => r.roles)[0];
+        expect(role?.tools).toEqual(["read", "write", "bash"]);
+    });
+
+    it("createTeamPlan explicit tools:[] keeps empty array (captain's choice)", () => {
+        const resources = loadTeamResources(projectRoot, defaultsDir);
+        const plan = createTeamPlan({
+            task: "no tools test",
+            roles: [{ title: "Observer", tools: [] }],
+        }, resources);
+        const role = plan.rounds.flatMap(r => r.roles)[0];
+        expect(role?.tools).toEqual([]);
+    });
+
+    it("createTeamPlan explicit tools override default", () => {
+        const resources = loadTeamResources(projectRoot, defaultsDir);
+        const plan = createTeamPlan({
+            task: "custom tools test",
+            roles: [{ title: "Linter", tools: ["read", "bash"] }],
+        }, resources);
+        const role = plan.rounds.flatMap(r => r.roles)[0];
+        expect(role?.tools).toEqual(["read", "bash"]);
+    });
+});
+
+describe("degraded worker status", () => {
+    function w(id: string, title: string, overrides: Partial<WorkerRun> = {}): WorkerRun {
+        return { roleId: id, title, task: "test", status: "succeeded", output: "ok", ...overrides };
+    }
+
+    it("determineTeamRunOutcome includes degraded workers as degraded", () => {
+        const workers: WorkerRun[] = [
+            w("w1", "Scout", { status: "succeeded", outputKind: "substantive" }),
+            w("w2", "Reviewer", { status: "degraded", outputKind: "substantive", budgetExceeded: true }),
+        ];
+        const outcome = determineTeamRunOutcome(workers);
+        expect(outcome.status).toBe("degraded");
+        expect(outcome.warnings.some(x => x.includes("degraded"))).toBe(true);
+    });
+
+    it("all succeeded workers = succeeded outcome", () => {
+        const workers: WorkerRun[] = [
+            w("w1", "A", { status: "succeeded", outputKind: "substantive" }),
+            w("w2", "B", { status: "succeeded", outputKind: "substantive" }),
+        ];
+        expect(determineTeamRunOutcome(workers).status).toBe("succeeded");
+    });
+});
+
 describe("handoff digest", () => {
     function handoffRun(): TeamRun {
         return {
@@ -896,7 +994,7 @@ describe("handoff digest", () => {
         const digest = buildHandoffDigest(handoffRun());
         expect(digest).toContain("Team Handoff — team_handoff_test");
         expect(digest).toContain("Status: degraded");
-        expect(digest).toContain("total:2 succeeded:1 failed:1 skipped:0");
+        expect(digest).toContain("total:2 succeeded:1 failed:1 degraded:0 skipped:0");
         expect(digest).toContain("Scout");
         expect(digest).toContain("/artifacts/scout.md");
         expect(digest).toContain("worker produced no assistant text");

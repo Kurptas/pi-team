@@ -68,6 +68,7 @@ export function buildTeamStatusProjection(
             active: activeWorkers.length,
             succeeded: workers.filter((worker) => worker.status === "succeeded").length,
             failed: workers.filter((worker) => worker.status === "failed").length,
+            degraded: workers.filter((worker) => worker.status === "degraded").length,
             skipped: workers.filter((worker) => worker.status === "skipped").length,
             stale: workers.filter((worker) => worker.stale).length,
             timedOut: workers.filter((worker) => worker.timedOut).length,

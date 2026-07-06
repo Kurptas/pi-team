@@ -248,13 +248,15 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
         name: "team",
         label: "Team",
         description:
-            "Run a lightweight multi-agent team. Loads Markdown playbooks/roles or lead-designed roles, observes candidate model health, dispatches Pi subprocess workers, and returns findings for lead synthesis.",
+            "Run a lightweight multi-agent team. BEFORE calling, read captain manual.\n\nCAPTAIN RULES: (1) Workers default to bash+read+write — use ls/find/grep to discover files, never guess paths. (2) Use thinking:\"high\" for review/code/analysis; stale ≠ stuck, 60-120s deep-thinking silence is NORMAL. (3) Cancel ONLY after 3+ frozen polls. (4) You own synthesis — workers provide evidence, not the verdict.\n\nLoads Markdown playbooks/roles or lead-designed roles, dispatches Pi subprocess workers, returns findings for lead synthesis.",
         promptSnippet: "Dispatch a small AI team and return captain-ready findings.",
         promptGuidelines: [
             "Use team when the task benefits from independent research, review, implementation checks, or multiple model perspectives.",
             "After dispatching a team, use team_status periodically to check worker progress, detect stalled/failed workers, and decide whether to intervene.",
             "Use team_message only to add material constraints, corrections, or priorities for workers in an active team run.",
             "If a worker shows no progress after 30+ seconds or output is empty, call team_status to inspect and consider team_cancel_worker if it appears stuck.",
+            "BEFORE dispatching: verify workers have bash/read/write. Set thinking:\"high\" for review/code/analysis. stale ≠ stuck (60-120s silence normal).",
+            "Cancel only after 3+ consecutive frozen polls. Do NOT outsource synthesis to workers — captain owns the final verdict.",
         ],
         parameters: TeamParams,
         async execute(_toolCallId, params, signal, onUpdate, ctx) {
@@ -622,7 +624,7 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
                               ? " cancel:requested"
                               : " cancel:observed";
                     const exitInfo =
-                        worker.status === "succeeded" || worker.status === "failed"
+                        worker.status === "succeeded" || worker.status === "failed" || worker.status === "degraded"
                             ? ` exit:${worker.exitCode ?? "?"}${worker.exitSignal ? `/${worker.exitSignal}` : ""}`
                             : "";
                     const toolSummary =
@@ -643,7 +645,7 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
                             `Team run ${run.runId}: ${run.status}`,
                             `playbook: ${run.playbookId}`,
                             `fallback policy: ${run.fallbackPolicy ?? "task_first"}`,
-                            `workers: total:${projection.counts.total} active:${projection.counts.active} succeeded:${projection.counts.succeeded} failed:${projection.counts.failed} skipped:${projection.counts.skipped} stale:${projection.counts.stale}`,
+                            `workers: total:${projection.counts.total} active:${projection.counts.active} succeeded:${projection.counts.succeeded} failed:${projection.counts.failed} degraded:${projection.counts.degraded} skipped:${projection.counts.skipped} stale:${projection.counts.stale}`,
                             `signals: timedOut:${projection.counts.timedOut} parseErrors:${projection.counts.parseErrors} toolViolations:${projection.counts.toolViolations}`,
                             `usage: req:${projection.counts.requests} tok:${projection.counts.tokens}${projection.counts.costUsd > 0 ? ` cost:$${projection.counts.costUsd.toFixed(4)}` : " cost:(none recorded)"}`,
                             `mailbox: ${projection.mailbox.file ?? "(none)"} messages:${projection.mailbox.messages}`,

@@ -84,19 +84,22 @@ function roleCapabilityNeeds(role: TeamInputRole | undefined): ModelCapabilityDi
     return role?.capabilityNeeds ?? NO_CAPABILITY_NEEDS;
 }
 
-function roleFromInput(role: TeamInputRole, index: number): RoleSpec {
+const REVIEW_MODES = new Set(["review", "code"]);
+
+function roleFromInput(role: TeamInputRole, index: number, mode?: string): RoleSpec {
     const title = role.title.trim();
     const id = role.id?.trim() ? slug(role.id, `role-${index + 1}`) : `custom-${slug(title, `role-${index + 1}`)}`;
     const capability = role.capability?.trim();
     const description = role.description?.trim() || capability || `Task-specific role: ${title}`;
     const modelFit = role.modelFit?.trim();
+    const defaultTools = ["read", "write", "bash"];
     return {
         id,
         title,
         description,
-        tools: role.tools ?? [],
+        tools: role.tools ?? defaultTools,
         modelPreferences: role.modelPreferences ?? [],
-        thinkingLevel: role.thinking,
+        thinkingLevel: role.thinking ?? (REVIEW_MODES.has(mode ?? "") ? "high" : undefined),
         outputSchema: "worker_finding",
         body:
             role.systemPrompt?.trim() ||
@@ -182,7 +185,7 @@ export function createTeamPlan(
     blueprint?: GeneratedTeamBlueprint,
 ): TeamPlan {
     const inputRoles: TeamInputRole[] = blueprint?.roles ?? input.roles ?? [];
-    const generatedRoles = inputRoles.map(roleFromInput).filter((role) => role.title.trim()) ?? [];
+    const generatedRoles = inputRoles.map((r, i) => roleFromInput(r, i, input.mode)).filter((role) => role.title.trim()) ?? [];
     const playbook =
         generatedRoles.length > 0
             ? generatedPlaybook(input, blueprint, generatedRoles)
@@ -207,6 +210,7 @@ export function createTeamPlan(
                     capability: sourceRole?.capability?.trim(),
                     capabilityNeeds: roleCapabilityNeeds(sourceRole),
                     modelFit: sourceRole?.modelFit?.trim(),
+                    thinkingLevel: planned.thinkingLevel ?? (REVIEW_MODES.has(input.mode ?? "") ? "high" : undefined),
                     dependsOn: sourceRole?.dependsOn,
                     reportsTo: sourceRole?.reportsTo,
                     sop: sourceRole?.sop,

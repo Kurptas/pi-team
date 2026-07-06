@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { codingThinkingLevel } from "./coding-thinking.ts";
+import { taskThinkingLevel } from "./coding-thinking.ts";
 import { parseConfiguredModelPreference } from "./model-selector.ts";
 import type { FallbackPolicy, ModelHealthSnapshot, ModelProbeStatus, PlannedRole, ThinkingLevel } from "./types.ts";
 
@@ -100,11 +100,11 @@ function cheapRecommendationKeys(doc: RecommendationsDoc | null): Set<string> {
     return new Set((doc?.recommendations ?? []).filter(isCheapRecommendation).map((entry) => entry.key));
 }
 
-// Resolve the effective thinking level for a candidate, applying coding-model
-// recommended thinking levels when the role is tagged with "coding".
+// Resolve the effective thinking level for a candidate, applying per-model
+// recommended thinking levels for coding roles.
 function effectiveThinkingLevel(role: PlannedRole, modelKey: string): ThinkingLevel | undefined {
     if (role.capabilityNeeds.includes("coding")) {
-        return codingThinkingLevel(modelKey) ?? role.thinkingLevel;
+        return taskThinkingLevel(modelKey, "coding") ?? role.thinkingLevel;
     }
     return role.thinkingLevel;
 }

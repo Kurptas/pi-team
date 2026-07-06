@@ -292,6 +292,7 @@ export function determineTeamRunOutcome(workers: WorkerRun[], undispatchedCount 
     const succeeded = workers.filter((worker) => worker.status === "succeeded");
     const failed = workers.filter((worker) => worker.status === "failed");
     const skipped = workers.filter((worker) => worker.status === "skipped");
+    const degraded = workers.filter((worker) => worker.status === "degraded");
     if (workers.length === 0) {
         return { status: "failed", warnings: ["no workers were planned or recorded"] };
     }
@@ -308,8 +309,10 @@ export function determineTeamRunOutcome(workers: WorkerRun[], undispatchedCount 
         if (failed.length > 0) warnings.push("all workers failed; no usable teammate evidence");
         return { status: "failed", warnings };
     }
-    if (failed.length > 0 || skipped.length > 0) {
+    if (degraded.length > 0) warnings.push(`${degraded.length} worker(s) degraded (budget exceeded — partial results may be available)`);
+    if (failed.length > 0 || skipped.length > 0 || degraded.length > 0) {
         if (failed.length > 0) warnings.push(`${failed.length} worker(s) failed`);
+        if (degraded.length > 0) warnings.push(`${degraded.length} worker(s) degraded (budget exceeded)`);
         if (skipped.length > 0) warnings.push(`${skipped.length} worker(s) skipped or aborted`);
         return { status: "degraded", warnings };
     }

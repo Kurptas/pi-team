@@ -35,7 +35,7 @@ export interface FanoutRoundConfig {
     collect?: FanoutCollectConfig;
 }
 
-export type WorkerStatus = "pending" | "running" | "succeeded" | "failed" | "skipped";
+export type WorkerStatus = "pending" | "running" | "succeeded" | "failed" | "degraded" | "skipped";
 
 export type WorkerOutputKind = "empty" | "radio_only" | "substantive";
 
