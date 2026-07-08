@@ -1,7 +1,7 @@
 {
   "name": "pi-team",
-  "version": "0.6.7",
-  "description": "A Pi extension that runs a task across multiple AI models — covering each other's blind spots, the right model for each job.",
+  "version": "0.6.8",
+  "description": "An extension for Pi and Oh My Pi that runs tasks across multiple AI models — covering each other's blind spots, the right model for each job.",
   "type": "module",
   "license": "MIT",
   "author": "Kurptas",
@@ -15,8 +15,13 @@
     "pi-package",
     "pi-extension",
     "omp-extension",
+    "pi",
+    "omp",
+    "oh-my-pi",
     "team",
-    "multi-agent"
+    "multi-agent",
+    "multi-llm",
+    "agent-orchestration"
   ],
   "pi": {
     "extensions": [

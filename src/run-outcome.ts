@@ -127,7 +127,34 @@ export function buildCaptainPreDelivery(
         outcome.status === "degraded" && succeeded.length > 0 && (context?.parallelRounds ?? 0) > 0
             ? `\n\nNote (factual): this plan ran ${context!.parallelRounds} parallel round(s) and ${succeeded.length} worker(s) returned usable findings. Parallel roles often cover deliberately different angles, so the extension cannot judge whether the surviving workers already cover the missing one — that coverage call is yours. Weigh whether the absent angle is essential before accepting or rejecting. This is a factual signal, not a quality verdict.`
             : "";
-    return `${header}\n\n${items.join("\n\n")}${succeededSummary}${parallelNote}\n\n---\n\nWorker outputs (for captain inspection):`;
+    return `${header}\n\n${items.join("\n\n")}${succeededSummary}${parallelNote}\n\n---\n\nWorker evidence digest (full outputs remain in artifacts):`;
+}
+
+function structuredResultSummary(worker: WorkerRun): string | undefined {
+    const value = worker.structuredOutput;
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+    const summary = (value as Record<string, unknown>).result_summary ?? (value as Record<string, unknown>).summary;
+    return typeof summary === "string" && summary.trim() ? summary.trim() : undefined;
+}
+
+function compactText(text: string, maxChars: number): string {
+    const compact = text.replace(/\s+/g, " ").trim();
+    if (compact.length <= maxChars) return compact;
+    return `${compact.slice(0, Math.max(0, maxChars - 1)).trimEnd()}…`;
+}
+
+export function summarizeWorkerDigests(workers: WorkerRun[]): string {
+    return workers
+        .map((worker) => {
+            const status = worker.status === "succeeded" ? "succeeded" : `${worker.status}: ${worker.errorReason ?? "n/a"}`;
+            const summaryCandidate = structuredResultSummary(worker) ?? worker.lastOutputPreview ?? compactText(worker.output, 280);
+            const summary = summaryCandidate || "(no summary)";
+            const route = worker.routingReason ? `\nRoute: ${worker.routingReason}` : "";
+            const fallback = worker.modelFallbackKeys && worker.modelFallbackKeys.length > 0 ? `\nFallbacks: ${worker.modelFallbackKeys.join(", ")}` : "";
+            const artifact = worker.outputFile ? `\nArtifact: ${worker.outputFile}` : "";
+            return `## ${worker.title} (${worker.roleId})\nModel: ${worker.model ?? "(unassigned)"}\nStatus: ${status}${route}${fallback}${artifact}\nSummary: ${summary}`;
+        })
+        .join("\n\n---\n\n");
 }
 
 export function buildFinalSummary(
@@ -137,9 +164,9 @@ export function buildFinalSummary(
 ): string {
     const checklist = buildCaptainPreDelivery(workers, outcome, context);
     if (outcome.status === "succeeded") {
-        return `${checklist}\n${summarizeWorkers(workers)}`;
+        return `${checklist}\n\n---\n\nWorker evidence digest (full outputs remain in artifacts):\n${summarizeWorkerDigests(workers)}`;
     }
-    return `${checklist}\n\n${summarizeWorkers(workers)}`;
+    return `${checklist}\n\n${summarizeWorkerDigests(workers)}`;
 }
 
 function isStructuredOutputObject(value: unknown): value is Record<string, unknown> {

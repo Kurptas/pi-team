@@ -1,5 +1,6 @@
 import { staleThresholdMs } from "./runner.ts";
 import type { TeamRun, WorkerRun } from "./types.ts";
+import { workerFactualPreview } from "./worker-preview.ts";
 
 const TEAM_STATUS_STALE_MS = staleThresholdMs();
 
@@ -27,6 +28,8 @@ export function buildTeamStatusProjection(
             model: worker.model,
             thinkingLevel: worker.thinkingLevel,
             status: worker.status,
+            routingReason: worker.routingReason,
+            modelFallbackKeys: worker.modelFallbackKeys,
             elapsedSeconds:
                 worker.startedAt === undefined
                     ? undefined
@@ -35,6 +38,7 @@ export function buildTeamStatusProjection(
             stale,
             activity: workerActivity(worker),
             outputKind: worker.outputKind,
+            factualPreview: workerFactualPreview(worker),
             timedOut: worker.timedOut === true,
             streamParseErrorCount: worker.streamParseErrorCount ?? 0,
             lastReportPreview: worker.lastReportPreview,

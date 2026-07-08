@@ -155,24 +155,6 @@ export function selectModelsToProbe(
             added.add(model.key);
         }
 
-        // ---- Level 1.5: default model as revealed-preference signal ----
-        // When a role has no explicit modelPreferences, the user's default model
-        // (first in configuredModels) is treated as a revealed-preference candidate
-        // that beats recommendation-table / fallback suggestions. Skipped under
-        // cheap_only — the policy explicitly asks for budget models and a premium
-        // default would contradict that intent.
-        if (candidates.length === 0 && role.modelPreferences.length === 0 && configured.length > 0 && fallbackPolicy !== "cheap_only") {
-            const defaultModel = configured[0]!;
-            if (!added.has(defaultModel.key)) {
-                candidates.push({
-                    key: defaultModel.key,
-                    source: "user_default",
-                    thinkingLevel: effectiveThinkingLevel(role, defaultModel.key),
-                    matchReason: "用户默认模型（配置第一项）",
-                });
-                added.add(defaultModel.key);
-            }
-        }
 
         const blockedByStrictPolicy = fallbackPolicy === "strict" && role.modelPreferences.length > 0 && failedUserPreferences.length > 0 && candidates.length === 0;
         // For non-strict policies we always want at least one healthy backup
@@ -210,6 +192,25 @@ export function selectModelsToProbe(
                 });
                 added.add(rec.key);
             }
+        }
+
+        // ---- Level 2.5: configured default only when no recommendation matched ----
+        // The original design is: captain explicit preference > fresh recommendation
+        // metadata > configured default/fallback. Do NOT let configured[0] bypass
+        // the model capability/recommendation document when that document is fresh
+        // and role-matched. If nothing matched (or recommendations are stale/missing),
+        // expose that fact in the reason and fall back to configured order.
+        if (candidates.length === 0 && role.modelPreferences.length === 0 && configured.length > 0 && fallbackPolicy !== "cheap_only") {
+            const defaultModel = configured[0]!;
+            candidates.push({
+                key: defaultModel.key,
+                source: "user_default",
+                thinkingLevel: effectiveThinkingLevel(role, defaultModel.key),
+                matchReason: recommendations && !stale
+                    ? "配置默认模型（无角色匹配的推荐元数据）"
+                    : "配置默认模型（推荐数据缺失或过期）",
+            });
+            added.add(defaultModel.key);
         }
 
         // ---- Level 3: fallback — fills remaining slots up to MIN_CANDIDATES ----
@@ -335,14 +336,15 @@ export function resolveProbeResults(
         // provider_error) is demoted; probe_passed AND probe_skipped (unproven,
         // not unavailable) both stay in the healthy tier, so an auto-probed
         // model never silently outranks an unprobed one. Within the same health
-        // tier we keep the original preference order: user > recommendation rank
-        // > fallback. This is an availability decision, not a quality judgment
-        // about which model is "better" — the captain still owns that.
+        // tier we keep the intended preference order: explicit user choice >
+        // fresh role recommendation > configured-order fallback > broad fallback.
+        // This is an availability decision, not a quality judgment about which
+        // model is "better" — the captain still owns that.
         workingCandidates.sort((a, b) => {
             const healthRank = (c: RoleModelCandidate) => (c.probeDegraded ? 1 : 0);
             const h = healthRank(a) - healthRank(b);
             if (h !== 0) return h;
-            const sourceOrder = { user: 0, user_default: 1, recommendation: 2, fallback: 3 };
+            const sourceOrder = { user: 0, recommendation: 1, user_default: 2, fallback: 3 };
             const s = sourceOrder[a.source] - sourceOrder[b.source];
             if (s !== 0) return s;
             return (a.recommendationRank ?? 99) - (b.recommendationRank ?? 99);

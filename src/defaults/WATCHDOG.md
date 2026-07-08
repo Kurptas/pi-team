@@ -1,7 +1,7 @@
 # 团队行为契约（默认 advisory 模板）
 
 > 这是 pi-team 内置的**默认 advisory 模板**，不是强制规则。
-> 它只在你没有自己的 `.pi/team/WATCHDOG.md`（项目级）或 `~/.pi/agent/team/WATCHDOG.md`（用户级）时作为参考被注入。
+> 它只在你没有自己的 `.pi/team/WATCHDOG.md` / `.omp/team/WATCHDOG.md`（项目级）或 `~/.pi/agent/team/WATCHDOG.md` / `~/.omp/agent/team/WATCHDOG.md`（用户级）时作为参考被注入。
 > 你可以在上述任一路径放一个自己的 WATCHDOG.md 来**完全覆盖**本模板，或留空以关闭它。
 > 也可以设置环境变量 `PI_TEAM_DISABLE_DEFAULT_WATCHDOG=1` 完全关闭这个内置默认模板（不影响你自己放的 WATCHDOG.md）。
 > 注入时它仍走 "weigh, don't blindly obey" 框架：worker 自行判断是否适用，captain 始终是最终裁决者。

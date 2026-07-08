@@ -22,6 +22,8 @@ function artifactMarkdown(worker: WorkerRun): string {
         "",
         `Status: ${worker.status}`,
         `Model: ${worker.model ?? "(unassigned)"}`,
+        worker.routingReason ? `Routing: ${worker.routingReason}` : undefined,
+        worker.modelFallbackKeys && worker.modelFallbackKeys.length > 0 ? `Fallback models: ${worker.modelFallbackKeys.join(", ")}` : undefined,
         `Tools: ${worker.tools?.join(", ") || "(none)"}`,
         worker.errorReason ? `Error: ${worker.errorReason}` : undefined,
         worker.requests !== undefined ? `Requests: ${worker.requests}` : undefined,

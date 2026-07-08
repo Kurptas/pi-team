@@ -3,7 +3,7 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 const MAX_SRC_LINES = 1200;
-const MAX_TEST_LINES = 2000;
+const MAX_TEST_LINES = 2400;
 const ROOTS = ["src", "test"];
 const EXTENSIONS = new Set([".ts", ".tsx", ".js", ".jsx", ".md", ".json"]);
 const EXCLUDED_PARTS = new Set(["node_modules", "dist", ".git", ".pi"]);

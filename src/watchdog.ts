@@ -117,8 +117,8 @@ export function formatWatchdogAdvisory(sources: WatchdogSource[]): string | unde
  * Octo-inspired three-law behavior contract shipped with the extension. It is
  * used ONLY when no user/project WATCHDOG.md exists, and it remains a fully
  * advisory, user-overridable file: a user can drop their own
- * `.pi/team/WATCHDOG.md` to replace it, or an empty one to silence it. The
- * contract never becomes an enforced rule — it is rendered through the same
+ * `.pi/team/WATCHDOG.md` or `.omp/team/WATCHDOG.md` to replace it, or an empty
+ * one to silence it. The contract never becomes an enforced rule — it is rendered through the same
  * "weigh, don't blindly obey" advisory block as any other watchdog source.
  *
  * A deployment that wants no bundled default at all (rather than dropping an

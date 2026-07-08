@@ -6,7 +6,7 @@ import type { KeyId } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { promoteBlueprintArtifact } from "./blueprint-store.ts";
 import { loadModelCapabilityProfiles } from "./capabilities.ts";
-import { appendTeamMessage, listTeamRunIds, prepareTeamControl, readTeamMailbox, readTeamState, requestTeamCancel, requestWorkerCancel, writeTeamState } from "./control.ts";
+import { appendTeamMessage, listTeamRunIds, markTeamObserved, prepareTeamControl, readTeamMailbox, readTeamObservation, readTeamState, requestTeamCancel, requestWorkerCancel, writeTeamState } from "./control.ts";
 import { buildHandoffDigest, readHandoff } from "./handoff.ts";
 import { loadTeamResources } from "./loader.ts";
 import { loadManual } from "./manual-loader.ts";
@@ -18,7 +18,7 @@ import { runTeamPlan, type TeamRunOptions } from "./runner.ts";
 import { createSemanticPlan } from "./semantic-planner.ts";
 import type { TeamEvent, TeamInput, TeamModel, TeamRun, WorkerRun, PlannedRole } from "./types.ts";
 import { clearLiveness, formatLivenessTag, recordAndDiffLiveness } from "./worker-liveness.ts";
-import { guardCancelLastWorker } from "./cancel-guard.ts";
+import { guardCancelLastWorker, resolveWorkerByKey } from "./cancel-guard.ts";
 import { TeamParams, TeamRunParams, TeamMessageParams, TeamCancelParams, TeamPromoteBlueprintParams, TeamCancelWorkerParams } from "./tool-params.ts";
 import { buildTeamStatusProjection } from "./status-projection.ts";
 export { buildTeamStatusProjection } from "./status-projection.ts";
@@ -33,6 +33,16 @@ export function decisionWindowMs(env: NodeJS.ProcessEnv = process.env): number {
     const configured = Number.parseInt(env.PI_TEAM_DECISION_WINDOW_MS ?? "", 10);
     return Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_DECISION_WINDOW_MS;
 }
+
+function compactRoutingReason(reason: string | undefined): string | undefined {
+    if (!reason) return undefined;
+    const policy = reason.match(/policy=([^;]+)/)?.[1]?.trim();
+    const via = reason.match(/selected via ([^;|]+)/)?.[1]?.trim();
+    const degraded = reason.includes("⚠️") ? "; degraded-pref" : "";
+    const compact = [policy ? `policy=${policy}` : undefined, via ? `via=${via}` : undefined].filter(Boolean).join("; ");
+    return compact ? `${compact}${degraded}` : reason;
+}
+
 const TEAM_WIDGET_KEY = "pi-team-workers";
 const TEAM_STATUS_KEY = "pi-team-status";
 
@@ -42,6 +52,7 @@ const backgroundRunControllers = new Map<string, AbortController>();
 // Observed runs: captain polled via team_status, no push unless failed.
 const captainCanceledRuns = new Set<string>();
 const observedRuns = new Set<string>();
+const terminalObservedRuns = new Set<string>();
 // (2026-07-05 B4) Timestamp each background run so we can reap module-level
 // state if its Promise never settles (model API deadlock, hung session,
 // orphaned process). Normal cleanup still happens in .then()/.catch(); this is
@@ -49,12 +60,17 @@ const observedRuns = new Set<string>();
 // the 1h runaway ceiling) are dropped when the next run starts.
 const backgroundRunStartedAt = new Map<string, number>();
 const STALE_RUN_REAP_MS = 2 * 60 * 60 * 1000;
+const TERMINAL_PUSH_GRACE_MS = 750;
+const WATCHED_RUN_PUSH_GRACE_MS = 10_000;
+const RECENT_OBSERVATION_MS = 30_000;
+const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 function reapStaleRunState(now: number): void {
     for (const [runId, startedAt] of backgroundRunStartedAt) {
         if (now - startedAt < STALE_RUN_REAP_MS) continue;
         backgroundRunControllers.delete(runId);
         captainCanceledRuns.delete(runId);
         observedRuns.delete(runId);
+        terminalObservedRuns.delete(runId);
         clearLiveness(runId);
         backgroundRunStartedAt.delete(runId);
     }
@@ -71,15 +87,18 @@ function teamInstruction(task: string): string {
 // completionPush / shouldPushCompletion / detectModelConvergence are pure
 // helpers extracted to notify-gating.ts (size gate). Re-exported here so
 // existing callers and tests keep their import path.
-import { completionPush, detectModelConvergence, shouldPushCompletion } from "./notify-gating.ts";
-export { completionPush, detectModelConvergence, shouldPushCompletion } from "./notify-gating.ts";
+import { completionPush, completionPushDelayMs, detectModelConvergence, shouldPushCompletion } from "./notify-gating.ts";
+export { completionPush, completionPushDelayMs, detectModelConvergence, shouldPushCompletion } from "./notify-gating.ts";
 
 // (2026-07-05 B6) Collision-resistant run id: Date.now alone is not unique for
 // two team() calls in the same millisecond. A collision would let one run's
 // background Promise delete the other's AbortController (un-abortable) or
-// inherit its canceled flag. Append a short random suffix. Exported for tests.
+// inherit its canceled flag. Use a process-local monotonic counter plus random
+// suffix so same-millisecond bursts stay unique. Exported for tests.
+let runIdCounter = 0;
 export function generateRunId(): string {
-    return `team_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+    runIdCounter = (runIdCounter + 1) % 0x1000000;
+    return `team_${Date.now().toString(36)}${runIdCounter.toString(36).padStart(4, "0")}${Math.random().toString(36).slice(2, 8)}`;
 }
 
 function makeRun(task: string, playbookId: string, fallbackPolicy?: TeamInput["fallbackPolicy"]): TeamRun {
@@ -430,7 +449,7 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
                     if (prepared.mailboxTextFile) {
                         await appendTeamMessage(ctx.cwd, run.runId,
                             `[pi-team decision window] User-specified model(s) ${cause}. ` +
-                            `Available: ${configuredKeys.slice(0, 5).join(", ")}${configuredKeys.length > 5 ? "..." : ""}. ` +
+                            `Available: ${configuredKeys.join(", ")}. ` +
                             `Reply with a model key to override. ${afterTimeout} Waiting ~${Math.round(windowMs / 1000)}s.`,
                             { system: true },
                         );
@@ -463,13 +482,40 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
                         if (wasCanceled) captainCanceledRuns.delete(run.runId);
                         clearTeamUi(finalRun.runId);
                         clearLiveness(finalRun.runId);
-                        await writeTeamState(ctx.cwd, finalRun);
-                        // Completion-push gating (2026-07-03 项7): canceled runs
-                        // never push; a run the captain already observed via
-                        // team_status does not push (noise) unless it failed.
-                        const wasObserved = observedRuns.has(finalRun.runId);
+                        const priorState = await readTeamState(ctx.cwd, finalRun.runId);
+                        const finalRunWithObservations = {
+                            ...finalRun,
+                            lastObservedAt: finalRun.lastObservedAt ?? priorState?.lastObservedAt,
+                            terminalObservedAt: finalRun.terminalObservedAt ?? priorState?.terminalObservedAt,
+                        };
+                        await writeTeamState(ctx.cwd, finalRunWithObservations);
+                        // If the captain is actively watching via team_status,
+                        // delay the follow-up longer than the tiny race grace so
+                        // a terminal poll can persist terminalObservedAt before a
+                        // queued follow-up is injected into the conversation.
+                        // Observation also lives in a small sidecar file because
+                        // background completion and team_status may run in
+                        // different extension/module instances; an in-memory Set
+                        // alone cannot cover that timing.
+                        const observation = await readTeamObservation(ctx.cwd, finalRun.runId);
+                        const wasObserved = observedRuns.has(finalRun.runId) || observation !== undefined;
+                        await delay(
+                            completionPushDelayMs({
+                                wasObserved,
+                                lastObservedAt: finalRunWithObservations.lastObservedAt ?? observation?.lastObservedAt,
+                                now: Date.now(),
+                                shortGraceMs: TERMINAL_PUSH_GRACE_MS,
+                                watchedGraceMs: WATCHED_RUN_PUSH_GRACE_MS,
+                                recentObservationMs: RECENT_OBSERVATION_MS,
+                            }),
+                        );
+                        const latestObservation = await readTeamObservation(ctx.cwd, finalRun.runId);
+                        const latestState = await readTeamState(ctx.cwd, finalRun.runId);
+                        const wasTerminalObserved =
+                            terminalObservedRuns.has(finalRun.runId) || latestObservation?.terminalObservedAt !== undefined || latestState?.terminalObservedAt !== undefined;
                         observedRuns.delete(finalRun.runId);
-                        if (!shouldPushCompletion(wasCanceled, wasObserved, finalRun.status)) return;
+                        terminalObservedRuns.delete(finalRun.runId);
+                        if (!shouldPushCompletion(wasCanceled, wasObserved, finalRun.status, wasTerminalObserved)) return;
                         const summary = finalRun.finalSummary
                             ? finalRun.finalSummary.split(/\r?\n/).slice(0, 3).join("\n")
                             : `${finalRun.workers.length} worker(s) completed.`;
@@ -492,8 +538,10 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
                         // Same gate as the success callback (one push policy).
                         // "failed" always pushes unless canceled. (2026-07-03 项7 M1.)
                         const wasObserved = observedRuns.has(errorRun.runId);
+                        const wasTerminalObserved = terminalObservedRuns.has(errorRun.runId);
                         observedRuns.delete(errorRun.runId);
-                        if (!shouldPushCompletion(wasCanceled, wasObserved, "failed")) return;
+                        terminalObservedRuns.delete(errorRun.runId);
+                        if (!shouldPushCompletion(wasCanceled, wasObserved, "failed", wasTerminalObserved)) return;
                         pi.sendUserMessage(completionPush(errorRun.runId, "failed", `Run crashed: ${String(error).slice(0, 200)}`), { deliverAs: "followUp" });
                     });
                 return {
@@ -578,7 +626,7 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
                     isError: true,
                 };
             }
-            const run = await readTeamState(ctx.cwd, runId);
+            let run = await readTeamState(ctx.cwd, runId);
             if (!run) {
                 return {
                     content: [{ type: "text", text: `Team run ${runId} was not found.` }],
@@ -586,10 +634,24 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
                     isError: true,
                 };
             }
-            // Mark run as observed so background completion skips the push (noise — captain is watching; failed runs still push).
+            // Mark run as observed so background completion can distinguish
+            // mid-run polling from already-seen terminal state.
             observedRuns.add(runId);
-            // Self-heal a stuck status line when the run reached terminal before the poll.
-            if (isTerminalStatus(run.status)) {
+            const observedAt = Date.now();
+            const terminal = isTerminalStatus(run.status);
+            await markTeamObserved(ctx.cwd, runId, { terminal, now: observedAt });
+            // Avoid rewriting a running state snapshot just to record observation:
+            // worker subprocesses may be writing fresh events concurrently. The
+            // sidecar observation file is enough while the run is active.
+            // Once terminal, no workers are writing, so persisting observation on
+            // the run state itself is safe for handoff/status visibility.
+            if (terminal) {
+                terminalObservedRuns.add(runId);
+                const shouldPersistObservation = run.terminalObservedAt === undefined || run.lastObservedAt === undefined;
+                if (shouldPersistObservation) {
+                    run = { ...run, lastObservedAt: observedAt, terminalObservedAt: run.terminalObservedAt ?? observedAt };
+                    await writeTeamState(ctx.cwd, run);
+                }
                 const ui = ctx.hasUI ? ctx.ui : sessionUi;
                 clearTeamUi(run.runId, ui);
                 clearLiveness(run.runId);
@@ -613,6 +675,9 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
                     const stale = worker.stale ? " stale" : "";
                     const usage = ` req:${worker.requests} tok:${worker.tokens}${worker.costUsd > 0 ? ` cost:$${worker.costUsd.toFixed(4)}` : ""}`;
                     const output = worker.outputKind ? ` output:${worker.outputKind}` : "";
+                    const route = worker.routingReason ? ` route:${compactRoutingReason(worker.routingReason)}` : "";
+                    const fallback = worker.modelFallbackKeys && worker.modelFallbackKeys.length > 0 ? ` fallback:[${worker.modelFallbackKeys.slice(0, 3).join(",")}]` : "";
+                    const summary = worker.status !== "running" && worker.factualPreview ? ` summary:${worker.factualPreview}` : "";
                     const report = worker.lastReportPreview ? ` report:${worker.lastReportPreview}` : "";
                     const captain = worker.lastCaptainMessagePreview
                         ? ` captain:${worker.lastCaptainMessagePreview}`
@@ -634,7 +699,7 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
                     const lane = worker.laneId ? ` lane:${worker.laneId.slice(-6)}` : "";
                     const roleTag = worker.roleId ? ` [${worker.roleId}]` : "";
                     const live = worker.status === "running" ? ` ${formatLivenessTag(worker.stale, liveness.get(worker.roleId))}` : "";
-                    return `${worker.status}${stale}${roleTag} ${worker.title} ${model}${thinking} ${elapsed} ${signal} ${worker.activity} events:${worker.eventCount}${usage}${output}${report}${captain}${cancelStatus}${exitInfo}${toolSummary}${activeToolSummary}${isolation}${lane}${live}`;
+                    return `${worker.status}${stale}${roleTag} ${worker.title} ${model}${thinking} ${elapsed} ${signal} ${worker.activity} events:${worker.eventCount}${usage}${output}${route}${fallback}${summary}${report}${captain}${cancelStatus}${exitInfo}${toolSummary}${activeToolSummary}${isolation}${lane}${live}`;
                 })
                 .join("\n");
             return {
@@ -711,14 +776,30 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
             }
             if (run.status !== "running") {
                 return {
-                    content: [{ type: "text", text: `Team run ${runId} is ${run.status}; there are no active workers to message.` }],
-                    details: { runId, status: run.status },
+                    content: [
+                        {
+                            type: "text",
+                            text:
+                                `Team run ${runId} is already ${run.status}; there are no active workers to message. ` +
+                                `This can happen in a timing race if workers finished between your last team_status poll and this control message. ` +
+                                `Check team_status before steering when the status may have changed.`,
+                        },
+                    ],
+                    details: { runId, status: run.status, activeWorkers: 0 },
                     isError: true,
                 };
             }
             const paths = await appendTeamMessage(ctx.cwd, runId, params.message);
             return {
-                content: [{ type: "text", text: `Captain message written for ${runId}: ${paths.mailboxFile}` }],
+                content: [
+                    {
+                        type: "text",
+                        text:
+                            `Captain message written for ${runId}: ${paths.mailboxFile}. ` +
+                            `This is cooperative steering, not an interrupt: a worker only sees it at its next decision point (after its current tool call finishes), so obedience is not immediate and is not guaranteed. ` +
+                            `For a hard stop of a specific worker, use team_cancel_worker.`,
+                    },
+                ],
                 details: { runId, mailboxFile: paths.mailboxFile, message: params.message },
             };
         },
@@ -805,7 +886,7 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
                     isError: true,
                 };
             }
-            const worker = run.workers.find((item) => item.roleId === roleId);
+            const worker = resolveWorkerByKey(run.workers, roleId);
             if (!worker) {
                 return {
                     content: [{ type: "text", text: `Worker ${roleId} was not found in run ${runId}. Use team_status to list active roleIds.` }],
@@ -813,20 +894,25 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
                     isError: true,
                 };
             }
+            // Continue with the worker's ACTUAL roleId, not the captain's input
+            // spelling — the cancel file, guard message, and result must key off
+            // the real id so the worker-side cancel check finds it.
+            const resolvedRoleId = worker.roleId;
             if (worker.status !== "running") {
                 return {
-                    content: [{ type: "text", text: `Worker ${roleId} in run ${runId} is already ${worker.status}.` }],
-                    details: { runId, roleId, status: worker.status },
+                    content: [{ type: "text", text: `Worker ${resolvedRoleId} in run ${runId} is already ${worker.status}.` }],
+                    details: { runId, roleId: resolvedRoleId, status: worker.status },
                     isError: true,
                 };
             }
             const reason = params.reason?.trim() || "captain canceled this worker";
-            const guard = guardCancelLastWorker(run.workers, roleId, runId, params.confirm === true); // P1 rigid-loop guard
-            if (!guard.ok) return { content: [{ type: "text", text: guard.message }], details: { runId, roleId, runningCount: guard.runningCount, needsConfirm: true }, isError: true };
-            const cancelFile = await requestWorkerCancel(ctx.cwd, runId, roleId, reason);
+            const guard = guardCancelLastWorker(run.workers, resolvedRoleId, runId, params.confirm === true); // P1 rigid-loop guard
+            if (!guard.ok) return { content: [{ type: "text", text: guard.message }], details: { runId, roleId: resolvedRoleId, runningCount: guard.runningCount, needsConfirm: true }, isError: true };
+            const cancelFile = await requestWorkerCancel(ctx.cwd, runId, resolvedRoleId, reason);
+            const matchNote = resolvedRoleId !== roleId ? ` (matched your input "${roleId}" to roleId "${resolvedRoleId}")` : "";
             return {
-                content: [{ type: "text", text: `Cancel requested for worker ${roleId} in run ${runId}: ${cancelFile}` }],
-                details: { runId, roleId, cancelFile, reason },
+                content: [{ type: "text", text: `Cancel requested for worker ${resolvedRoleId} in run ${runId}${matchNote}: ${cancelFile}. Cooperative stop: the worker ends after its current tool call finishes.` }],
+                details: { runId, roleId: resolvedRoleId, cancelFile, reason },
             };
         },
     });

@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { teamControlPaths, teamRunLogDir } from "./control.ts";
 import type { TeamRun, WorkerRun } from "./types.ts";
+import { workerFactualPreview } from "./worker-preview.ts";
 
 /**
  * Handoff digest — a *factual* run summary for durable resume / handoff.
@@ -24,7 +25,11 @@ function workerLine(worker: WorkerRun): string {
     const usage = `req:${worker.requests ?? 0} tok:${worker.tokens ?? 0}${(worker.costUsd ?? 0) > 0 ? ` cost:$${(worker.costUsd ?? 0).toFixed(4)}` : ""}`;
     const reason = worker.errorReason ? ` — ${worker.errorReason}` : "";
     const artifact = worker.outputFile ? `\n  - output: ${worker.outputFile}` : "";
-    return `- **${worker.title}** (${worker.roleId}): ${worker.status} [${kind}] · ${model} · ${usage}${reason}${artifact}`;
+    const route = worker.routingReason ? `\n  - route: ${worker.routingReason}` : "";
+    const fallback = worker.modelFallbackKeys && worker.modelFallbackKeys.length > 0 ? `\n  - fallback: ${worker.modelFallbackKeys.join(", ")}` : "";
+    const preview = workerFactualPreview(worker);
+    const summary = preview ? `\n  - summary: ${preview}` : "";
+    return `- **${worker.title}** (${worker.roleId}): ${worker.status} [${kind}] · ${model} · ${usage}${reason}${route}${fallback}${summary}${artifact}`;
 }
 
 /**

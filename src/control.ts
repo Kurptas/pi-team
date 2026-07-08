@@ -9,6 +9,13 @@ export interface TeamControlPaths {
     mailboxTextFile: string;
     cancelFile: string;
     stateFile: string;
+    observationFile: string;
+}
+
+export interface TeamObservation {
+    runId: string;
+    lastObservedAt: number;
+    terminalObservedAt?: number;
 }
 
 export interface TeamMailboxMessage {
@@ -49,6 +56,7 @@ export function teamControlPaths(cwd: string, runId: string): TeamControlPaths {
         mailboxTextFile: path.join(activeDir, "mailbox.txt"),
         cancelFile: path.join(activeDir, "cancel.json"),
         stateFile: path.join(activeDir, "state.json"),
+        observationFile: path.join(activeDir, "observation.json"),
     };
 }
 
@@ -197,6 +205,36 @@ export async function readTeamMailbox(cwd: string, runId: string): Promise<TeamM
             }
         })
         .filter((message): message is TeamMailboxMessage => message !== undefined);
+}
+
+export async function readTeamObservation(cwd: string, runId: string): Promise<TeamObservation | undefined> {
+    const paths = teamControlPaths(cwd, runId);
+    try {
+        const parsed = JSON.parse(await fs.promises.readFile(paths.observationFile, "utf-8")) as TeamObservation;
+        return typeof parsed.lastObservedAt === "number" ? parsed : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+export async function markTeamObserved(
+    cwd: string,
+    runId: string,
+    options: { terminal?: boolean; now?: number } = {},
+): Promise<TeamObservation> {
+    const paths = teamControlPaths(cwd, runId);
+    await fs.promises.mkdir(paths.activeDir, { recursive: true });
+    const now = options.now ?? Date.now();
+    const existing = await readTeamObservation(cwd, runId);
+    const observation: TeamObservation = {
+        runId,
+        lastObservedAt: now,
+        terminalObservedAt: options.terminal ? existing?.terminalObservedAt ?? now : existing?.terminalObservedAt,
+    };
+    const tmpFile = `${paths.observationFile}.tmp`;
+    await fs.promises.writeFile(tmpFile, `${JSON.stringify(observation, null, 2)}\n`, "utf-8");
+    await fs.promises.rename(tmpFile, paths.observationFile);
+    return observation;
 }
 
 export async function readTeamState(cwd: string, runId: string): Promise<TeamRun | undefined> {

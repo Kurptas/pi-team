@@ -1,6 +1,6 @@
 {
-  "generatedAt": "2026-06-29T00:00:00Z",
-  "version": "1",
+  "generatedAt": "2026-07-07T00:00:00Z",
+  "version": "2",
   "recommendations": [
     {
       "rank": 1,
@@ -37,8 +37,8 @@
     {
       "rank": 5,
       "key": "deepseek/deepseek-v4-pro",
-      "roles": ["research-scout", "scout", "planner", "research-synthesizer"],
-      "strength": "快速推理、低成本，适合规划和研究收尾",
+      "roles": ["reviewer", "evidence-checker", "fix-validator", "research-scout", "scout", "planner", "research-synthesizer"],
+      "strength": "强推理、agentic coding 和技术审查能力，适合代码审查、验证、规划和研究收尾",
       "speed": "fast",
       "costTier": "efficient"
     },

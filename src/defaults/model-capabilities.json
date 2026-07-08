@@ -133,18 +133,20 @@
         {
             "family": "deepseek-family",
             "models": [
+                "deepseek/deepseek-v4-pro",
                 "deepseek/deepseek-v4-flash",
                 "deepseek/deepseek-reasoner",
                 "deepseek/deepseek-chat"
             ],
             "aliases": [
+                "deepseek-v4-pro",
                 "deepseek-v4-flash",
                 "deepseek-v4",
                 "deepseek-reasoner",
                 "deepseek"
             ],
             "displayName": "DeepSeek family",
-            "summary": "DeepSeek family capability profile. Official DeepSeek V4 preview emphasizes reasoning, Math/STEM/coding, and agentic coding; DeepSeek reasoner documentation also highlights JSON output support.",
+            "summary": "DeepSeek family capability profile. Official DeepSeek V4 preview says V4-Pro has enhanced agentic capabilities and world-class Math/STEM/Coding reasoning, while V4-Flash is the faster/economical option for simpler agent tasks; DeepSeek reasoner documentation also highlights JSON output support.",
             "strengths": [
                 "reasoning",
                 "coding",

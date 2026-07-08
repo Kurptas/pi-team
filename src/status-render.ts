@@ -101,9 +101,11 @@ export function renderTeamDetails(run: TeamRun, theme: Theme): Component {
     const lines = [compactTeamLine(run, theme)];
     for (const worker of projection.workers) {
         const output = worker.outputKind ? ` output:${worker.outputKind}` : "";
+        const route = worker.routingReason ? ` route:${fitVisible(worker.routingReason, 96)}` : "";
+        const summary = worker.status !== "running" && worker.factualPreview ? ` summary:${worker.factualPreview}` : "";
         const report = worker.lastReportPreview ? ` report:${worker.lastReportPreview}` : "";
         const error = worker.errorReason ? ` error:${worker.errorReason}` : "";
-        lines.push(`${workerCompactLine(worker, theme)}${output}${report}${error}`);
+        lines.push(`${workerCompactLine(worker, theme)}${output}${route}${summary}${report}${error}`);
     }
     return truncatedLines(lines);
 }

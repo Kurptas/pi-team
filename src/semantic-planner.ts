@@ -288,7 +288,7 @@ function plannerPrompt(input: TeamInput, inheritedTools: string[], profiles: Mod
         "modelPreferences 由你根据任务、角色和模型能力事实填写；扩展只执行你的偏好并过滤客观不可用模型。",
         "视角多样性：当多个角色是并行的独立视角（如多方评审、多角度论证），倾向为它们指定不同的模型或 provider，避免全部落到同一模型而丧失多模型视角；除非某角色确有唯一最适配的模型。",
         "当只有唯一可用模型时，单一模型承担多个角色是可以接受的——无需多样性焦虑。",
-        "如果用户未指定 modelPreferences，系统会优先使用配置中的第一个模型（用户默认模型）作为候选。",
+        "模型选择优先级：用户/captain 显式 modelPreferences 永远优先；未指定时才参考 fresh model-recommendations 与 capability facts；无匹配或推荐过期时回退 configured order。不要臆测不可验证的模型强弱。",
         "progressMilestones 要服务于队长的 Plan-Do-Check-Act 推进，让队长能判断是否需要补查、换角色或汇总。",
         "请依据用户任务的语义自行决定流程、角色数、角色抽象层级和轮次。角色名体现可复用的能力和责任；当用户任务要求单点核验时，角色名可以指向具体核验对象。",
         "把扩展视为通信、控制和观测通道；最终判断、完成度判断和责任归主 Agent 队长。",

@@ -12,32 +12,18 @@ description: Operating procedure for code-review workers. Which files to read, w
 
 ## Before Reviewing
 
-1. **Read the actual code, do not guess**: use `read` to read the full file under review; do not infer content from the filename or description.
-2. **Understand the context**: read related test files to learn expected behavior; read types.ts / interface definitions to learn data shapes.
-3. **Scope the review**: only review the files and functionality the captain assigned; do not spread into unrelated code.
+1. **Read the actual code**: `read` the full file under review; never infer from filename/description.
+2. **Understand context**: read related tests (expected behavior) and types/interfaces (data shapes).
+3. **Scope**: review only the assigned files; do not spread into unrelated code.
 
 ## Review Dimensions
 
-Check each dimension below and give an independent conclusion for each:
+Give an independent conclusion for each:
 
-### Correctness
-- Are there logic bugs (edge cases, null values, races)?
-- Do return values and side effects match the caller's expectations?
-- Are all error paths handled?
-
-### Security
-- Any injection risk (SQL, command, path traversal)?
-- Any missing permission checks?
-- Is sensitive data improperly exposed or logged?
-
-### Testability
-- Is the core logic a pure function that can be tested independently?
-- Can side effects be mocked or isolated?
-- Do existing tests cover the critical paths?
-
-### North-Star Compliance (pi-team specific)
-- Does it follow the "the tool is a channel, it does not decide for the captain" principle?
-- Is there hardcoded decision logic that should be under the captain's control?
+- **Correctness**: logic bugs (edge cases, nulls, races); return/side effects match caller expectations; all error paths handled.
+- **Security**: injection risk (SQL, command, path traversal); missing permission checks; sensitive data exposed or logged.
+- **Testability**: core logic testable as a pure function; side effects mockable; existing tests cover critical paths.
+- **North-Star (pi-team)**: follows "tool is a channel, not a decision-maker"; no hardcoded logic that should be captain-controlled.
 
 ## Output Format
 
@@ -45,19 +31,24 @@ Check each dimension below and give an independent conclusion for each:
 ## VERDICT: [SHIP | REVISE | BLOCK]
 
 ### CRITICAL issues (if any → must BLOCK or REVISE)
-- [C1] description | location: file:line | suggested fix
+- [C1] description | location: file:line | evidence | suggested fix
 
 ### MAJOR issues
-- [M1] description | location | suggested fix
+- [M1] description | location | evidence | suggested fix
 
 ### MINOR issues
-- [m1] description | location | suggested fix
+- [m1] description | location | evidence | suggested fix
 
 ### North-Star Compliance
 ✅ / ⚠️ explanation
 
 ### Evidence Sources
-- which files were read, line ranges
+- files read with line ranges
+- commands/tools used
+- checks not run and why
+
+### Residual Risks
+- what remains unverified
 ```
 
 ## Reverse-Verification Requirement
@@ -71,5 +62,5 @@ Do not report "might be a problem but I didn't verify" — that has no value to 
 ## Prohibited
 
 - Do not modify the code under review (read-only).
-- Do not run tests (report test coverage, do not execute).
+- Do not run tests unless the captain explicitly assigned validation; if not run, list them under checks not run.
 - Do not make architectural suggestions beyond review scope (record as "out of scope: …" without expanding).

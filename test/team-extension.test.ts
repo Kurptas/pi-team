@@ -28,6 +28,7 @@ import { modelKey, routeTeamPlan, selectModelForRole } from "../src/model-router
 import { createTeamPlan, selectPlaybook } from "../src/planner.ts";
 import {
 	buildCaptainPreDelivery,
+	buildFinalSummary,
 	buildRunAbsorption,
 	createQueuedStateWriter,
 	dedupRoundRoles,
@@ -214,6 +215,7 @@ describe("team extension", () => {
 		expect(prompt).toContain("Report progress to the captain");
 		expect(prompt).toContain("RADIO:");
 		expect(prompt).toContain("Do not spawn subagents or start nested team runs");
+		expect(prompt).toContain("keep final output concise");
 	});
 
 	it("injects worker runtime context so teammates can report model, tools, and mailbox", () => {
@@ -556,6 +558,30 @@ describe("team extension", () => {
 		expect(checklist).toContain("aborted");
 		expect(checklist).toContain("Action required");
 		expect(checklist).toContain("Succeeded Worker");
+	});
+
+	it("builds a foreground digest without dumping full worker output", () => {
+		const longOutput = "detailed evidence ".repeat(80);
+		const summary = buildFinalSummary([
+			{
+				roleId: "reviewer",
+				title: "Reviewer",
+				task: "Review",
+				status: "succeeded",
+				output: longOutput,
+				lastOutputPreview: "short factual preview",
+				model: "deepseek/deepseek-v4-pro",
+				routingReason: "policy=task_first; selected via recommendation; captain remains final judge",
+				modelFallbackKeys: ["deepseek/deepseek-v4-flash"],
+				outputFile: "/artifacts/reviewer.md",
+			},
+		], { status: "succeeded", warnings: [] });
+		expect(summary).toContain("Worker evidence digest");
+		expect(summary).toContain("Route: policy=task_first");
+		expect(summary).toContain("Fallbacks: deepseek/deepseek-v4-flash");
+		expect(summary).toContain("Artifact: /artifacts/reviewer.md");
+		expect(summary).toContain("Summary: short factual preview");
+		expect(summary).not.toContain(longOutput);
 	});
 
 	it("adds a factual parallel-round note only when degraded with survivors and parallel rounds", () => {

@@ -6,20 +6,40 @@
 // Background push: deliverAs followUp so the captain's next turn wakes.
 export function completionPush(runId: string, status: string, workerSummary: string): string {
     return [
-        `[pi-team] Background team run ${runId} finished with status: ${status}.`,
+        `[pi-team auto] Background team run ${runId} finished with status: ${status}.`,
         workerSummary,
         `You are still the captain. Inspect it with team_status(runId="${runId}") and wrap up: judge whether the evidence satisfies the task, decide if another pass is needed, and deliver the final answer.`,
     ].join("\n");
 }
 
-// completionPush gating (2026-07-04 P0 fix): a TERMINAL transition
-// (succeeded/degraded/failed) always pushes; only an explicit captain cancel
-// suppresses. Previously `!wasObserved` ate successful/degraded pushes after a
-// single team_status poll — the captain forgets to keep polling (real incident).
-// `_wasObserved` retained in the signature for callers but no longer gates.
-export function shouldPushCompletion(wasCanceled: boolean, _wasObserved: boolean, status: string): boolean {
+// completionPush gating (2026-07-04/08): polling a RUNNING background run
+// must not swallow its terminal reminder (captains often forget to keep
+// polling). But once the captain has already observed the TERMINAL state via
+// team_status, a second success/degraded follow-up is duplicate noise. Failed
+// terminal states still push unless explicitly canceled.
+export function shouldPushCompletion(
+    wasCanceled: boolean,
+    _wasObserved: boolean,
+    status: string,
+    wasTerminalObserved = false,
+): boolean {
     if (wasCanceled) return false;
-    return status === "succeeded" || status === "degraded" || status === "failed";
+    if (status === "failed") return true;
+    if (wasTerminalObserved) return false;
+    return status === "succeeded" || status === "degraded";
+}
+
+export function completionPushDelayMs(options: {
+    wasObserved: boolean;
+    lastObservedAt?: number;
+    now: number;
+    shortGraceMs: number;
+    watchedGraceMs: number;
+    recentObservationMs: number;
+}): number {
+    const { wasObserved, lastObservedAt, now, shortGraceMs, watchedGraceMs, recentObservationMs } = options;
+    const recentlyObserved = lastObservedAt !== undefined && now - lastObservedAt < recentObservationMs;
+    return wasObserved || recentlyObserved ? watchedGraceMs : shortGraceMs;
 }
 
 // Single-model convergence: when multiple parallel roles route to the same

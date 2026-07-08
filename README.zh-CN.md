@@ -22,6 +22,8 @@
 
 ## 安装
 
+### Pi
+
 **推荐方式**
 
 ```bash
@@ -31,10 +33,26 @@ pi install npm:pi-team
 **固定版本安装**
 
 ```bash
-pi install git:github.com/Kurptas/pi-team@v0.6.4
+pi install npm:pi-team@0.6.8
 ```
 
 装完在 Pi 里敲 `/reload` 就生效了。
+
+### Oh My Pi
+
+pi-team 也可以作为 Oh My Pi 扩展使用。安装时使用 `omp` 命令。
+
+```bash
+omp install pi-team
+```
+
+**固定版本安装**
+
+```bash
+omp install pi-team@0.6.8
+```
+
+安装后重启或 reload Oh My Pi。
 
 ## 两句话就能跑起来
 

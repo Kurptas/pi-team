@@ -44,8 +44,10 @@ Coding tasks default to `medium`, unless deep architectural reasoning requires `
 
 ## Watching Workers (team_status)
 
+- For multi-step/high-risk work, prefer background runs so you can inspect, steer, or cancel. Foreground is fine for short read-only checks where you do not need mid-run control.
 - **`stale` ≠ stuck**. A worker composing a long conclusion emits no events and looks stale, but is fully alive.
 - Check `live:progressing(Δtok, Δreq)`: if tokens/requests grew since your last poll → the worker is advancing, do not cancel.
+- Read each worker row as a control surface: model/routing reason, output kind, factual summary, last tool/report, liveness, cost.
 - Only when you see `live:stuck` **and** it stays frozen across multiple consecutive polls should you consider cancel.
 - Silence during synthesis/deep-thinking is normal, not a fault.
 
@@ -66,9 +68,10 @@ Coding tasks default to `medium`, unless deep architectural reasoning requires `
 ## Evidence & Decision Gates
 
 - Workers report progress via RADIO messages; watch them to track progress.
-- `team_status` shows each worker's output kind, last tool, last report, and liveness state.
+- `team_status` shows each worker's output kind, routing reason, factual preview, fallback models, last tool/report, and liveness state.
 - **Synthesis is the captain's responsibility** — do not outsource it to a worker. Workers provide evidence, you provide judgment.
-- After all workers complete, read the artifacts yourself and form the final conclusion.
+- After completion, start from the digest/status preview; open artifacts only for disputed, blocking, or high-impact evidence. Do not let full logs replace judgment.
+- Before final delivery, name any failed/degraded/missing angle and decide whether to accept, retry, spawn a role, or ask the user.
 
 ## Common Patterns
 

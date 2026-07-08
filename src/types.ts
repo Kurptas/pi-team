@@ -265,6 +265,8 @@ export interface WorkerRun {
     task: string;
     model?: string;
     thinkingLevel?: ThinkingLevel;
+    routingReason?: string;
+    modelFallbackKeys?: string[];
     status: WorkerStatus;
     output: string;
     tools?: string[];
@@ -336,6 +338,10 @@ export interface TeamRun {
     events?: TeamEvent[];
     lastEvent?: TeamEvent;
     stateWriteError?: string;
+    /** Set whenever team_status has shown this run to the captain. Used to delay noisy background follow-ups while the captain is actively watching. */
+    lastObservedAt?: number;
+    /** Set when team_status has shown a terminal run to the captain. Suppresses duplicate success/degraded follow-up pushes. */
+    terminalObservedAt?: number;
     resultAvailability?: "empty" | "radio_only" | "partial" | "substantive";
     evidenceCompleteness?: {
         hasEvidenceRefs: boolean;

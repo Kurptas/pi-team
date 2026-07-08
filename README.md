@@ -18,6 +18,8 @@
 
 ## Install
 
+### Pi
+
 **Recommended**
 
 ```bash
@@ -27,10 +29,26 @@ pi install npm:pi-team
 **Pin a specific version**
 
 ```bash
-pi install git:github.com/Kurptas/pi-team@v0.6.4
+pi install npm:pi-team@0.6.8
 ```
 
 Then run `/reload` in Pi to activate it.
+
+### Oh My Pi
+
+pi-team also works as an extension for Oh My Pi. Use the `omp` command to install it.
+
+```bash
+omp install pi-team
+```
+
+**Pin a specific version**
+
+```bash
+omp install pi-team@0.6.8
+```
+
+Then restart or reload Oh My Pi.
 
 ## Try it in one line
 

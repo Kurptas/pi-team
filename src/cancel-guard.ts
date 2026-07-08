@@ -1,4 +1,31 @@
-import type { TeamRun } from "./types.ts";
+import type { TeamRun, WorkerRun } from "./types.ts";
+
+// Same normalization the planner uses to derive roleId from a raw id/title
+// (planner.ts slug()). Kept in sync so a captain can cancel by the id they
+// authored, the slugified roleId shown in team_status, or the worker title —
+// without guessing the exact separator style. Control reliability > input
+// pedantry: a cancel that fails on a separator mismatch undermines captain
+// control at the moment it matters most.
+function normalizeRoleKey(value: string): string {
+    return value
+        .toLowerCase()
+        .replace(/[^\p{L}\p{N}]+/gu, "-")
+        .replace(/^-+|-+$/g, "");
+}
+
+// Resolve a captain-supplied worker key to an actual worker. Tolerant by
+// design: exact roleId first (fast path), then normalized roleId/title. The
+// tolerant path must be UNIQUE; if two workers collapse to the same key, fail
+// closed rather than canceling the wrong teammate.
+export function resolveWorkerByKey(workers: WorkerRun[], key: string): WorkerRun | undefined {
+    const exact = workers.find((w) => w.roleId === key);
+    if (exact) return exact;
+    const normalized = normalizeRoleKey(key);
+    const matches = workers.filter(
+        (w) => normalizeRoleKey(w.roleId) === normalized || normalizeRoleKey(w.title) === normalized,
+    );
+    return matches.length === 1 ? matches[0] : undefined;
+}
 
 export type CancelWorkerGuard =
     | { ok: true }
