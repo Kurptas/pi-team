@@ -22,7 +22,7 @@ import {
 	teamRunLogDir,
 	writeTeamState,
 } from "../src/control.ts";
-import { buildTeamStatusProjection, refreshTeamModelRegistry } from "../src/index.ts";
+import { backgroundNextAction, buildTeamStatusProjection, refreshTeamModelRegistry } from "../src/index.ts";
 import { loadTeamResources } from "../src/loader.ts";
 import { modelKey, routeTeamPlan, selectModelForRole } from "../src/model-router.ts";
 import { createTeamPlan, selectPlaybook } from "../src/planner.ts";
@@ -560,6 +560,26 @@ describe("team extension", () => {
 		expect(checklist).toContain("Succeeded Worker");
 	});
 
+	it("labels captain-stopped runs as partial evidence, not ordinary failure", () => {
+		const workers: WorkerRun[] = [
+			{
+				roleId: "risk",
+				title: "Risk Analyst",
+				task: "Find risks",
+				status: "skipped",
+				output: "RADIO: found partial risks",
+				outputKind: "radio_only",
+				errorReason: "aborted",
+				cancelObservedAt: 123,
+			},
+		];
+		const checklist = buildCaptainPreDelivery(workers, { status: "stopped", warnings: [] });
+		expect(checklist).toContain("CAPTAIN-STOPPED");
+		expect(checklist).toContain("partial teammate evidence");
+		expect(checklist).toContain("was stopped before a final teammate memo");
+		expect(checklist).toContain("tell the user this perspective was captain-stopped");
+	});
+
 	it("builds a foreground digest without dumping full worker output", () => {
 		const longOutput = "detailed evidence ".repeat(80);
 		const summary = buildFinalSummary([
@@ -724,6 +744,21 @@ describe("team extension", () => {
 				},
 			]),
 		).toEqual({
+			status: "stopped",
+			warnings: ["captain stopped all workers before final teammate outputs; only partial/RADIO evidence may be available"],
+		});
+		expect(
+			determineTeamRunOutcome([
+				{
+					roleId: "a",
+					title: "A",
+					task: "A",
+					status: "skipped",
+					output: "",
+					errorReason: "no healthy model",
+				},
+			]),
+		).toEqual({
 			status: "failed",
 			warnings: ["all workers were skipped or aborted; no usable teammate evidence"],
 		});
@@ -734,7 +769,7 @@ describe("team extension", () => {
 			]),
 		).toEqual({
 			status: "degraded",
-			warnings: ["1 worker(s) skipped or aborted"],
+			warnings: ["1 worker(s) captain-stopped before final teammate output"],
 		});
 		expect(
 			determineTeamRunOutcome([
@@ -874,6 +909,14 @@ describe("team extension", () => {
 			},
 		} as any);
 		expect(calls).toEqual(["auth.reload", "model.refresh"]);
+	});
+
+	it("refreshes an Oh My Pi-style registry without authStorage", () => {
+		const calls: string[] = [];
+		expect(() => refreshTeamModelRegistry({
+			modelRegistry: { refresh: () => calls.push("model.refresh") },
+		} as any)).not.toThrow();
+		expect(calls).toEqual(["model.refresh"]);
 	});
 
 	it("routes roles only to models that passed live probe", () => {
@@ -1103,7 +1146,7 @@ describe("team extension", () => {
 				playbookId: "generated-blueprint",
 				status: "running",
 				modelHealth: [
-					{ model: "provider/model", provider: "provider", status: "probe_passed", latencyMs: 10, checkedAt: 1 },
+					{ model: "provider/model", provider: "provider", status: "probe_passed", evidenceSource: "probe", latencyMs: 10, checkedAt: 1 },
 				],
 				workers: [
 					{
@@ -1136,6 +1179,10 @@ describe("team extension", () => {
 						outputKind: "substantive",
 						activeTools: ["read", "bash"],
 						toolIsolationViolation: "active tools exceed role whitelist: bash",
+						events: [
+							{ phase: "worker-tool", message: "Done Worker tool_execution_start read", toolName: "read" },
+							{ phase: "worker-tool", message: "Done Worker tool_execution_end read failed", toolName: "read", isError: true },
+						],
 						requests: 1,
 						tokens: 50,
 						costUsd: 0.02,
@@ -1147,19 +1194,52 @@ describe("team extension", () => {
 			30_000,
 		);
 
-		expect(projection.counts).toMatchObject({ total: 2, active: 1, succeeded: 1, stale: 1, parseErrors: 2, toolViolations: 1, requests: 3, tokens: 150, costUsd: 0.03 });
+		expect(projection.counts).toMatchObject({ total: 2, active: 1, succeeded: 1, stale: 1, parseErrors: 2, toolViolations: 1, toolCalls: 1, toolErrors: 1, requests: 3, tokens: 150, costUsd: 0.03 });
 		expect(projection.workers[0]?.activeTools).toEqual(["read"]);
+		expect(projection.workers[1]).toMatchObject({ toolCallCount: 1, toolErrorCount: 1 });
 		expect(projection.workers[1]?.toolIsolationViolation).toContain("bash");
+		expect(projection.modelHealth[0]?.evidenceSource).toBe("probe");
 		expect(projection.mailbox.lastMessagePreview).toBe("check source");
 		expect(projection.evidenceWarnings).toEqual(["1 worker(s) had malformed event stream lines"]);
-		expect(projection.controls).toEqual(["team_message", "team_cancel"]);
+		expect(projection.controls).toEqual(["team_message", "team_cancel_worker", "team_spawn_worker", "team_cancel"]);
+	});
+
+	it("projects controls for every run phase without treating synthesis as terminal", () => {
+		const baseRun: TeamRun = {
+			runId: "team_controls",
+			task: "observe controls",
+			playbookId: "generated-blueprint",
+			status: "planning",
+			modelHealth: [],
+			workers: [],
+			events: [],
+		};
+		for (const status of ["planning", "probing", "synthesizing"] as const) {
+			expect(buildTeamStatusProjection({ ...baseRun, status }, []).controls).toEqual(["team_cancel"]);
+		}
+		expect(buildTeamStatusProjection({ ...baseRun, status: "running" }, []).controls).toEqual([
+			"team_message", "team_cancel_worker", "team_spawn_worker", "team_cancel",
+		]);
+		for (const status of ["succeeded", "degraded", "stopped", "failed"] as const) {
+			expect(buildTeamStatusProjection({ ...baseRun, status }, []).controls).toEqual([
+				"team_handoff", "team_promote_blueprint",
+			]);
+		}
+	});
+
+	it("uses push-first next actions except during a model decision window", () => {
+		expect(backgroundNextAction(false)).toBe("await_completion_push");
+		expect(backgroundNextAction(true)).toBe("captain_model_decision");
 	});
 
 	it("renders team tool progress compactly with expandable worker details", () => {
 		const result = registerTeamExtension();
 		const team = result.tools.get("team");
 		expect(team?.promptSnippet).toContain("Dispatch");
-		expect(team?.promptGuidelines.join("\n")).toContain("Use team when");
+		expect(team?.promptGuidelines.join("\n")).toContain("push-first");
+		expect(team?.promptGuidelines.join("\n")).toContain("Do not poll");
+		expect(team?.promptGuidelines.join("\n")).not.toContain("frozen polls");
+		expect(result.tools.get("team_status")?.promptGuidelines.join("\n")).toContain("do not use it as a timer");
 
 		const run: TeamRun = {
 			runId: "team_ui",
@@ -1316,5 +1396,75 @@ describe("team extension", () => {
 			ui,
 		} as any);
 		expect(calls).toHaveLength(0);
+	});
+
+	it("rejects team_cancel for a terminal or invalid run without writing a cancel file", async () => {
+		const result = registerTeamExtension();
+		const teamCancel = result.tools.get("team_cancel");
+		await writeTeamState(tempDir, {
+			runId: "team_terminal_cancel",
+			task: "already done",
+			playbookId: "generated-blueprint",
+			status: "succeeded",
+			modelHealth: [],
+			workers: [],
+			events: [],
+		});
+		const terminal = await teamCancel!.execute("cancel-terminal", { runId: "team_terminal_cancel" }, undefined, undefined, { cwd: tempDir } as any);
+		expect(terminal.content[0]?.text).toContain("already succeeded");
+		expect(isTeamCancelRequested(tempDir, "team_terminal_cancel")).toBe(false);
+
+		const invalid = await teamCancel!.execute("cancel-invalid", { runId: "../escape" }, undefined, undefined, { cwd: tempDir } as any);
+		expect(invalid.isError).toBe(true);
+		expect(invalid.content[0]?.text).toBe("No team run found.");
+	});
+
+	it("queues a valid spawn request but rejects empty spawn fields immediately", async () => {
+		const result = registerTeamExtension();
+		const spawn = result.tools.get("team_spawn_worker");
+		await writeTeamState(tempDir, {
+			runId: "team_spawn_request",
+			task: "spawn",
+			playbookId: "generated-blueprint",
+			status: "running",
+			modelHealth: [],
+			workers: [],
+			events: [],
+		});
+		const invalid = await spawn!.execute("spawn-empty", { runId: "team_spawn_request", roleId: " ", title: "Reviewer", task: "Review" }, undefined, undefined, { cwd: tempDir } as any);
+		expect(invalid.isError).toBe(true);
+		expect(await readTeamMailbox(tempDir, "team_spawn_request")).toHaveLength(0);
+
+		const queued = await spawn!.execute("spawn-valid", { runId: "team_spawn_request", roleId: "reviewer", title: "Reviewer", task: "Review" }, undefined, undefined, { cwd: tempDir } as any);
+		expect(queued.content[0]?.text).toContain("spawn requested");
+		expect(queued.content[0]?.text).toContain("spawn-accepted or spawn-rejected");
+		expect(await readTeamMailbox(tempDir, "team_spawn_request")).toHaveLength(1);
+	});
+
+	it("reports ambiguous team_cancel_worker keys with exact candidates", async () => {
+		const result = registerTeamExtension();
+		const cancelWorker = result.tools.get("team_cancel_worker");
+		const worker = (roleId: string): WorkerRun => ({
+			roleId,
+			title: "Reviewer",
+			task: "review",
+			status: "running",
+			output: "",
+			tools: [],
+		});
+		await writeTeamState(tempDir, {
+			runId: "team_ambiguous_cancel",
+			task: "cancel",
+			playbookId: "generated-blueprint",
+			status: "running",
+			modelHealth: [],
+			workers: [worker("reviewer-a"), worker("reviewer-b")],
+			events: [],
+		});
+		const out = await cancelWorker!.execute("cancel-ambiguous", { runId: "team_ambiguous_cancel", roleId: "reviewer" }, undefined, undefined, { cwd: tempDir } as any);
+		expect(out.isError).toBe(true);
+		expect(out.content[0]?.text).toContain("is ambiguous");
+		expect(out.content[0]?.text).toContain("reviewer-a (Reviewer)");
+		expect(out.content[0]?.text).toContain("reviewer-b (Reviewer)");
 	});
 });

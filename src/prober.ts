@@ -113,7 +113,7 @@ interface ProbeSession {
 type ProbeSessionFactory = (options: {
     cwd: string;
     model: Model<Api>;
-    thinkingLevel: "medium";
+    thinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
     noTools: "all";
     sessionManager: ReturnType<typeof SessionManager.inMemory>;
 }) => Promise<{ session: ProbeSession; assistantText: () => string }>;
@@ -189,7 +189,8 @@ export function createInProcessProbe(
             const created = await sessionFactory({
                 cwd,
                 model: resolved,
-                thinkingLevel: "medium",
+                // Omit thinking for liveness probes. Provider/model defaults are
+                // safer than assuming every OpenAI-compatible gateway accepts a fixed level.
                 noTools: "all",
                 sessionManager: SessionManager.inMemory(cwd),
             });

@@ -19,7 +19,6 @@ export function completionPush(runId: string, status: string, workerSummary: str
 // terminal states still push unless explicitly canceled.
 export function shouldPushCompletion(
     wasCanceled: boolean,
-    _wasObserved: boolean,
     status: string,
     wasTerminalObserved = false,
 ): boolean {
@@ -42,18 +41,21 @@ export function completionPushDelayMs(options: {
     return wasObserved || recentlyObserved ? watchedGraceMs : shortGraceMs;
 }
 
-// Single-model convergence: when multiple parallel roles route to the same
-// model, the run loses its multi-model perspective. Flag it only when >1 role
-// assigned AND another healthy model existed to diversify to — otherwise
-// convergence was forced by hardware availability, not a planning miss.
-// (2026-07-02 single-model-convergence fix #3; 2026-07-03 项5 suppression.)
-export function detectModelConvergence(assignedModels: string[], healthyModelCount: number): string | undefined {
+// Model diversity loss: compare assigned diversity with the maximum diversity
+// possible from role count and healthy models. This catches partial collapse
+// (for example 4 requested roles routed to only 2 models), not only 4→1.
+export function detectModelConvergence(
+    assignedModels: string[],
+    healthyModelCount: number,
+    intendedDistinctModelCount = healthyModelCount,
+): string | undefined {
     if (assignedModels.length <= 1) return undefined;
     const distinct = new Set(assignedModels);
-    if (distinct.size !== 1 || healthyModelCount <= 1) return undefined;
+    const possibleDistinct = Math.min(assignedModels.length, Math.max(healthyModelCount, intendedDistinctModelCount));
+    if (distinct.size >= possibleDistinct) return undefined;
     return (
-        `\u26a0 Model convergence: all ${assignedModels.length} worker(s) routed to ${[...distinct][0]} ` +
-        `despite ${healthyModelCount} healthy models available \u2014 multi-model perspective is lost. ` +
-        `Consider overriding a role's model or re-planning if diverse viewpoints matter.`
+        `\u26a0 Model diversity reduced: ${assignedModels.length} worker(s) use ${distinct.size} distinct model(s) ` +
+        `against a target of ${possibleDistinct} healthy/requested model(s). ` +
+        `Review fallback routing before dispatch if independent model perspectives matter.`
     );
 }

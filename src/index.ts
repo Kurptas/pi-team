@@ -12,6 +12,7 @@ import { loadTeamResources } from "./loader.ts";
 import { loadManual } from "./manual-loader.ts";
 import { probePlan } from "./plan-probe.ts";
 import { routeTeamPlan, toTeamModels } from "./model-router.ts";
+import { parseModelPreference } from "./model-selector.ts";
 import { createTeamPlan } from "./planner.ts";
 import { createCliProbe, createInProcessProbe } from "./prober.ts";
 import { runTeamPlan, type TeamRunOptions } from "./runner.ts";
@@ -22,6 +23,9 @@ import { guardCancelLastWorker, resolveWorkerByKey } from "./cancel-guard.ts";
 import { TeamParams, TeamRunParams, TeamMessageParams, TeamCancelParams, TeamPromoteBlueprintParams, TeamCancelWorkerParams } from "./tool-params.ts";
 import { buildTeamStatusProjection } from "./status-projection.ts";
 export { buildTeamStatusProjection } from "./status-projection.ts";
+import {
+    captainAttentionPush, startCaptainAttentionMonitor, type CaptainAttentionMonitorHandle,
+} from "./captain-attention.ts";
 import { isTerminalStatus, teamCountSummary, teamWidget, teamWidgetLines, truncatedLines, renderTeamCompact, renderPlainResult } from "./status-render.ts";
 export { teamWidgetLines } from "./status-render.ts";
 
@@ -32,6 +36,10 @@ const DEFAULT_DECISION_WINDOW_MS = 15_000;
 export function decisionWindowMs(env: NodeJS.ProcessEnv = process.env): number {
     const configured = Number.parseInt(env.PI_TEAM_DECISION_WINDOW_MS ?? "", 10);
     return Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_DECISION_WINDOW_MS;
+}
+
+export function backgroundNextAction(hasPendingModelDecision: boolean): "captain_model_decision" | "await_completion_push" {
+    return hasPendingModelDecision ? "captain_model_decision" : "await_completion_push";
 }
 
 function compactRoutingReason(reason: string | undefined): string | undefined {
@@ -59,6 +67,11 @@ const terminalObservedRuns = new Set<string>();
 // a bounded-memory backstop only. Entries older than the reap horizon (well past
 // the 1h runaway ceiling) are dropped when the next run starts.
 const backgroundRunStartedAt = new Map<string, number>();
+const backgroundAttentionMonitors = new Map<string, CaptainAttentionMonitorHandle>();
+function stopBackgroundAttentionMonitor(runId: string): void {
+    backgroundAttentionMonitors.get(runId)?.stop();
+    backgroundAttentionMonitors.delete(runId);
+}
 const STALE_RUN_REAP_MS = 2 * 60 * 60 * 1000;
 const TERMINAL_PUSH_GRACE_MS = 750;
 const WATCHED_RUN_PUSH_GRACE_MS = 10_000;
@@ -72,6 +85,7 @@ function reapStaleRunState(now: number): void {
         observedRuns.delete(runId);
         terminalObservedRuns.delete(runId);
         clearLiveness(runId);
+        stopBackgroundAttentionMonitor(runId);
         backgroundRunStartedAt.delete(runId);
     }
 }
@@ -101,6 +115,11 @@ export function generateRunId(): string {
     return `team_${Date.now().toString(36)}${runIdCounter.toString(36).padStart(4, "0")}${Math.random().toString(36).slice(2, 8)}`;
 }
 
+export function shouldDirectModelDispatch(input: TeamInput, hasSemanticPlan: boolean): boolean {
+    return !hasSemanticPlan && (input.roles?.length ?? 0) > 0 &&
+        (input.roles ?? []).every((role) => (role.modelPreferences?.length ?? 0) > 0);
+}
+
 function makeRun(task: string, playbookId: string, fallbackPolicy?: TeamInput["fallbackPolicy"]): TeamRun {
     return {
         runId: generateRunId(),
@@ -120,15 +139,27 @@ function inheritedTeamTools(pi: ExtensionAPI): string[] {
         .filter((tool) => tool && tool !== "team");
 }
 
+function safeRunId(value: string): boolean {
+    return /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value);
+}
+
 async function resolveRunId(cwd: string, requestedRunId: string | undefined): Promise<string | undefined> {
-    if (requestedRunId?.trim()) return requestedRunId.trim();
+    if (requestedRunId?.trim()) {
+        const runId = requestedRunId.trim();
+        return safeRunId(runId) ? runId : undefined;
+    }
     const runIds = await listTeamRunIds(cwd);
-    return runIds.at(-1);
+    return runIds.filter((runId) => safeRunId(runId)).at(-1);
 }
 
 export function refreshTeamModelRegistry(ctx: Pick<ExtensionContext, "modelRegistry">): void {
-    ctx.modelRegistry.authStorage.reload();
-    ctx.modelRegistry.refresh();
+    // Pi exposes authStorage; Oh My Pi may only expose the public registry API.
+    // Refresh auth opportunistically without requiring a runtime-internal field.
+    const registry = ctx.modelRegistry as ExtensionContext["modelRegistry"] & {
+        authStorage?: { reload?: () => void };
+    };
+    registry.authStorage?.reload?.();
+    registry.refresh();
 }
 
 
@@ -205,6 +236,18 @@ function logUpdate(
 }
 
 export default function teamExtension(pi: ExtensionAPI) {
+    const startBackgroundAttentionMonitor = (cwd: string, runId: string): void => {
+        stopBackgroundAttentionMonitor(runId);
+        backgroundAttentionMonitors.set(runId, startCaptainAttentionMonitor({
+            readRun: () => readTeamState(cwd, runId),
+            isTerminal: (run) => isTerminalStatus(run.status),
+            isCanceled: () => captainCanceledRuns.has(runId),
+            onAttention: (alerts) => {
+                pi.sendUserMessage(captainAttentionPush(runId, alerts), { deliverAs: "followUp" });
+            },
+        }));
+    };
+
     pi.registerCommand("team", {
         description: "Run a lightweight multi-agent team from Markdown playbooks and roles",
         handler: async (args, ctx) => {
@@ -267,15 +310,15 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
         name: "team",
         label: "Team",
         description:
-            "Run a lightweight multi-agent team. BEFORE calling, read captain manual.\n\nCAPTAIN RULES: (1) Workers default to bash+read+write — use ls/find/grep to discover files, never guess paths. (2) Use thinking:\"high\" for review/code/analysis; stale ≠ stuck, 60-120s deep-thinking silence is NORMAL. (3) Cancel ONLY after 3+ frozen polls. (4) You own synthesis — workers provide evidence, not the verdict.\n\nLoads Markdown playbooks/roles or lead-designed roles, dispatches Pi subprocess workers, returns findings for lead synthesis.",
+            "Run a lightweight multi-agent team. BEFORE calling, read captain manual.\n\nCAPTAIN RULES: (1) Workers default to bash+read+write — use ls/find/grep to discover files, never guess paths. (2) Use thinking:\"high\" for review/code/analysis; stale ≠ stuck, 60-120s deep-thinking silence is NORMAL. (3) Background runs are push-first — do not poll a normally progressing run. (4) Cancel only after sustained frozen evidence. (5) You own synthesis — workers provide evidence, not the verdict.\n\nLoads Markdown playbooks/roles or lead-designed roles, dispatches Pi subprocess workers, returns findings for lead synthesis.",
         promptSnippet: "Dispatch a small AI team and return captain-ready findings.",
         promptGuidelines: [
             "Use team when the task benefits from independent research, review, implementation checks, or multiple model perspectives.",
-            "After dispatching a team, use team_status periodically to check worker progress, detect stalled/failed workers, and decide whether to intervene.",
+            "Background runs are push-first: after the initial dispatch result, end the turn and wait for a completion or captain-attention follow-up. Do not poll a normally progressing run.",
             "Use team_message only to add material constraints, corrections, or priorities for workers in an active team run.",
-            "If a worker shows no progress after 30+ seconds or output is empty, call team_status to inspect and consider team_cancel_worker if it appears stuck.",
+            "Use team_status once after a completion/attention push, an explicit user request, or immediately before a control decision; attention notifications never auto-cancel workers.",
             "BEFORE dispatching: verify workers have bash/read/write. Set thinking:\"high\" for review/code/analysis. stale ≠ stuck (60-120s silence normal).",
-            "Cancel only after 3+ consecutive frozen polls. Do NOT outsource synthesis to workers — captain owns the final verdict.",
+            "Cancel only after a runtime attention signal plus corroborating frozen/off-track/runaway evidence. Do NOT outsource synthesis to workers — captain owns the final verdict.",
         ],
         parameters: TeamParams,
         async execute(_toolCallId, params, signal, onUpdate, ctx) {
@@ -335,20 +378,12 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
             // probePlan wraps select → probe → resolve into a single call and
             // returns deadBlueprintModels so the semantic-planner can do ONE
             // revision pass with unavailableModels as hard constraints.
-            const directDispatch =
-                !semanticPlan &&
-                (input.roles?.length ?? 0) > 0 &&
-                (input.roles ?? []).every(
-                    (role) =>
-                        (role.modelPreferences?.length ?? 0) > 0 &&
-                        (role.dependsOn?.length ?? 0) === 0 &&
-                        (role.reportsTo?.length ?? 0) === 0,
-                );
+            const directDispatch = shouldDirectModelDispatch(input, semanticPlan !== undefined);
             const probe = input.probeModels === false
                 ? ((model: TeamModel) => Promise.resolve({ model: `${model.provider}/${model.id}`, provider: model.provider, status: "probe_skipped" as const, latencyMs: 0, reason: "probeModels=false", checkedAt: Date.now() }))
                 : process.env.PI_TEAM_PROBE_USE_CLI === "1" ? createCliProbe() : createInProcessProbe(ctx.modelRegistry, ctx.cwd);
 
-            let result = await probePlan(plan, configuredModels, availableModels, defaultsDir, fallbackPolicy, directDispatch, probe, signal);
+            let result = await probePlan(plan, configuredModels, availableModels, defaultsDir, fallbackPolicy, directDispatch, probe, signal, input.probeModels !== false);
             let deadBlueprint = result.deadBlueprintModels;
             let currentPlan = plan;
 
@@ -359,7 +394,7 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
                 const revised = await createSemanticPlan(ctx.cwd, input, inheritedTools, capabilityProfiles, signal, deadBlueprint);
                 if (revised) {
                     currentPlan = createTeamPlan({ ...input, roles: revised.roles }, resources, revised);
-                    result = await probePlan(currentPlan, configuredModels, availableModels, defaultsDir, fallbackPolicy, directDispatch, probe, signal);
+                    result = await probePlan(currentPlan, configuredModels, availableModels, defaultsDir, fallbackPolicy, directDispatch, probe, signal, input.probeModels !== false);
                 }
             }
             const { probeSet, modelHealth: health, resolved } = result;
@@ -369,7 +404,7 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
                 phase: "model-observe-start",
                 message: `selected ${probeSet.models.length}/${availableModels.length} relevant model(s) to probe across ${currentPlan.rounds.flatMap((r) => r.roles).length} role(s); fallbackPolicy=${fallbackPolicy}` +
                     (directDispatch ? "; direct-dispatch (captain fully specified — probing only chosen models as liveness check)" : "") +
-                    (deadBlueprint.length > 0 ? `; blueprint revision: ${deadBlueprint.length} unavailable model(s) → replanned` : "") +
+                    (semanticPlan && deadBlueprint.length > 0 ? `; blueprint revision: ${deadBlueprint.length} unavailable model(s) → replanned` : "") +
                     (probeSet.recommendationStale ? `; recommendation data stale (${Math.round(probeSet.recommendationAgeDays)}d)` : "") +
                     (probeSet.warnings.length > 0 ? `; ${probeSet.warnings.join(" | ")}` : ""),
                 status: run.status,
@@ -406,7 +441,13 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
                 .map((r) => r.selectedModel)
                 .filter((m): m is string => Boolean(m));
             const healthyModelCount = health.filter((h) => h.status === "probe_passed" || h.status === "probe_skipped").length;
-            const convergenceNotice = detectModelConvergence(assignedModels, healthyModelCount);
+            const intendedDistinctModelCount = new Set(
+                currentPlan.rounds.flatMap((round) => round.roles)
+                    .map((role) => role.modelPreferences[0])
+                    .filter((preference): preference is string => Boolean(preference))
+                    .map((preference) => parseModelPreference(preference).model),
+            ).size;
+            const convergenceNotice = detectModelConvergence(assignedModels, healthyModelCount, intendedDistinctModelCount);
 
             if (input.background !== false) {
                 const prepared = await prepareTeamControl(ctx.cwd, run);
@@ -435,22 +476,32 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
                             ? "On timeout, affected role(s) stay UNASSIGNED and will be skipped (strict: no automatic substitution)."
                             : "On timeout, auto-fallback to a healthy model proceeds.";
                     const cause = degraded.length > 0
-                        ? `unavailable/probe-degraded: ${prefList.join(", ")}`
+                        ? `unavailable/recent-worker-failed: ${prefList.join(", ")}`
                         : `unavailable: ${prefList.join(", ")}`;
+                    const affectedRoles = resolved.rolePlans
+                        .map((rolePlan) => ({
+                            roleId: rolePlan.roleId,
+                            preferences: [...new Set([...rolePlan.failedUserPreferences, ...rolePlan.degradedUserPreferences])],
+                        }))
+                        .filter((role) => role.preferences.length > 0);
                     pendingModelDecision = {
                         failedPrefs: prefList,
+                        affectedRoles,
                         configuredKeys,
-                        deadlineAt: Date.now() + windowMs,
+                        windowMs,
                         policy: fallbackPolicy,
                     };
+                    const overrideHint = affectedRoles.length === 1
+                        ? `<model key> or ${affectedRoles[0].roleId}=<model key>`
+                        : affectedRoles.map((role) => `${role.roleId}=<model key>`).join(" ");
                     decisionNotice =
                         `[!] Model decision window (~${Math.round(windowMs / 1000)}s): your model preference(s) ${cause}. ` +
-                        `Reply with team_message(runId="${run.runId}", "<model key>") to override. ${afterTimeout}`;
+                        `Reply with team_message(runId="${run.runId}", "${overrideHint}") to override by role. ${afterTimeout}`;
                     if (prepared.mailboxTextFile) {
                         await appendTeamMessage(ctx.cwd, run.runId,
                             `[pi-team decision window] User-specified model(s) ${cause}. ` +
                             `Available: ${configuredKeys.join(", ")}. ` +
-                            `Reply with a model key to override. ${afterTimeout} Waiting ~${Math.round(windowMs / 1000)}s.`,
+                            `Reply with roleId=modelKey to override individual roles. ${afterTimeout} Waiting ~${Math.round(windowMs / 1000)}s.`,
                             { system: true },
                         );
                     }
@@ -471,13 +522,18 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
                 const runController = new AbortController();
                 backgroundRunControllers.set(run.runId, runController);
                 backgroundRunStartedAt.set(run.runId, Date.now());
+                startBackgroundAttentionMonitor(ctx.cwd, run.runId);
                 reapStaleRunState(Date.now());
                 const detachedRun = { ...prepared, workers: [] as WorkerRun[] };
                 const backgroundUpdate = teamUpdateSink(undefined);
-                runTeamPlan(ctx.cwd, routedPlan, detachedRun, { inheritedTools, modelRegistry: ctx.modelRegistry, pendingModelDecision, defaultsDir }, runController.signal, backgroundUpdate)
+                runTeamPlan(ctx.cwd, routedPlan, detachedRun, {
+                    inheritedTools, modelRegistry: ctx.modelRegistry, pendingModelDecision, defaultsDir,
+                    modelDiversity: { healthyModelCount, intendedDistinctModelCount },
+                }, runController.signal, backgroundUpdate)
                     .then(async (finalRun) => {
                         backgroundRunControllers.delete(run.runId);
                         backgroundRunStartedAt.delete(run.runId);
+                        stopBackgroundAttentionMonitor(run.runId);
                         const wasCanceled = captainCanceledRuns.has(run.runId);
                         if (wasCanceled) captainCanceledRuns.delete(run.runId);
                         clearTeamUi(finalRun.runId);
@@ -515,7 +571,7 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
                             terminalObservedRuns.has(finalRun.runId) || latestObservation?.terminalObservedAt !== undefined || latestState?.terminalObservedAt !== undefined;
                         observedRuns.delete(finalRun.runId);
                         terminalObservedRuns.delete(finalRun.runId);
-                        if (!shouldPushCompletion(wasCanceled, wasObserved, finalRun.status, wasTerminalObserved)) return;
+                        if (!shouldPushCompletion(wasCanceled, finalRun.status, wasTerminalObserved)) return;
                         const summary = finalRun.finalSummary
                             ? finalRun.finalSummary.split(/\r?\n/).slice(0, 3).join("\n")
                             : `${finalRun.workers.length} worker(s) completed.`;
@@ -524,6 +580,7 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
                     .catch(async (error) => {
                         backgroundRunControllers.delete(run.runId);
                         backgroundRunStartedAt.delete(run.runId);
+                        stopBackgroundAttentionMonitor(run.runId);
                         const wasCanceled = captainCanceledRuns.has(run.runId);
                         if (wasCanceled) captainCanceledRuns.delete(run.runId);
                         const errorRun: TeamRun = {
@@ -537,11 +594,9 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
                         await writeTeamState(ctx.cwd, errorRun);
                         // Same gate as the success callback (one push policy).
                         // "failed" always pushes unless canceled. (2026-07-03 项7 M1.)
-                        const wasObserved = observedRuns.has(errorRun.runId);
-                        const wasTerminalObserved = terminalObservedRuns.has(errorRun.runId);
                         observedRuns.delete(errorRun.runId);
                         terminalObservedRuns.delete(errorRun.runId);
-                        if (!shouldPushCompletion(wasCanceled, wasObserved, "failed", wasTerminalObserved)) return;
+                        if (!shouldPushCompletion(wasCanceled, "failed")) return;
                         pi.sendUserMessage(completionPush(errorRun.runId, "failed", `Run crashed: ${String(error).slice(0, 200)}`), { deliverAs: "followUp" });
                     });
                 return {
@@ -554,22 +609,30 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
                                 // top of the captain-visible result, not just buried in the mailbox.
                                 // (2026-07-02 fallback-gaps: gap A.)
                                 ...(decisionNotice ? [decisionNotice, ""] : []),
-                                ...(convergenceNotice ? [convergenceNotice, ""] : []),
-                                `Observe: team_status(runId="${run.runId}")`,
+                                ...(!pendingModelDecision && convergenceNotice ? [convergenceNotice, ""] : []),
+                                `Inspect after a completion/attention push: team_status(runId="${run.runId}")`,
                                 `Control: team_message / team_cancel_worker(runId="${run.runId}")`,
                                 `Cancel: team_cancel(runId="${run.runId}")`,
                                 "",
                                 "IMPORTANT: You are still the captain. The team is running in background now.",
-                                "Do NOT just wait — use team_status periodically to check progress.",
-                                "If workers are stalled, empty, or failed — intervene with team_cancel_worker or team_message.",
+                                pendingModelDecision
+                                    ? "Next action: send a valid role-specific model decision or allow the bounded decision window to expire."
+                                    : "Next action: await_completion_push. End this turn; do not poll just to measure time.",
+                                "The runtime will send a captain-attention follow-up after sustained recorded silence; it never auto-cancels workers.",
                             ].join("\n"),
                         },
                     ],
-                    details: { runId: run.runId, activeDir: prepared.activeDir, status: "running" },
+                    details: {
+                        runId: run.runId, activeDir: prepared.activeDir, status: "running",
+                        nextAction: backgroundNextAction(pendingModelDecision !== undefined),
+                    },
                 };
             }
 
-            run = await runTeamPlan(ctx.cwd, routedPlan, run, { inheritedTools, modelRegistry: ctx.modelRegistry, defaultsDir }, signal, teamUpdate);
+            run = await runTeamPlan(ctx.cwd, routedPlan, run, {
+                inheritedTools, modelRegistry: ctx.modelRegistry, defaultsDir,
+                modelDiversity: { healthyModelCount, intendedDistinctModelCount },
+            }, signal, teamUpdate);
             clearLiveness(run.runId); // M1: foreground run also needs cleanup
             pi.appendEntry("team-run", run);
 
@@ -613,8 +676,8 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
             "Observe a team run from the captain side. Reads the latest active or persisted team state with worker events and mailbox path.",
         promptSnippet: "Observe current or latest team run status without re-dispatching workers.",
         promptGuidelines: [
-            "Use team_status before final synthesis when a team run is still active or was started in background.",
-            "Use team_status to inspect worker failures, stale workers, mailbox messages, and model health before deciding next action.",
+            "Use team_status once after a completion/attention push, an explicit user request, or immediately before a control decision; do not use it as a timer.",
+            "Use team_status to inspect worker failures, sustained-silence evidence, mailbox messages, and model health before deciding next action.",
         ],
         parameters: TeamRunParams,
         async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -659,7 +722,8 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
             const mailboxMessages = run.mailboxFile ? await readTeamMailbox(ctx.cwd, run.runId) : [];
             const projection = buildTeamStatusProjection(run, mailboxMessages);
             const liveness = recordAndDiffLiveness(run.runId, projection.workers.map((w) => ({ roleId: w.roleId, tokens: w.tokens, requests: w.requests, eventCount: w.eventCount }))); // 项9: diff usage vs prior poll -> "progressing" vs "frozen"
-            const health = projection.modelHealth.map((snapshot) => `${snapshot.model}:${snapshot.status}`).join(", ");
+            const health = projection.modelHealth
+                .map((snapshot) => `${snapshot.model}:${snapshot.status}/${snapshot.evidenceSource ?? "unknown"}`).join(", ");
             const workers = projection.workers
                 .map((worker) => {
                     const model = worker.model ?? "(unassigned)";
@@ -674,6 +738,7 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
                               : `signal:${worker.signalAgeSeconds}s`;
                     const stale = worker.stale ? " stale" : "";
                     const usage = ` req:${worker.requests} tok:${worker.tokens}${worker.costUsd > 0 ? ` cost:$${worker.costUsd.toFixed(4)}` : ""}`;
+                    const toolCounts = ` toolCalls:${worker.toolCallCount}${worker.toolErrorCount > 0 ? ` toolErrors:${worker.toolErrorCount}` : ""}`;
                     const output = worker.outputKind ? ` output:${worker.outputKind}` : "";
                     const route = worker.routingReason ? ` route:${compactRoutingReason(worker.routingReason)}` : "";
                     const fallback = worker.modelFallbackKeys && worker.modelFallbackKeys.length > 0 ? ` fallback:[${worker.modelFallbackKeys.slice(0, 3).join(",")}]` : "";
@@ -696,10 +761,10 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
                         worker.tools && worker.tools.length > 0 ? ` tools:[${worker.tools.slice(0, 3).join(",")}${worker.tools.length > 3 ? "..." : ""}]` : "";
                     const activeToolSummary = worker.activeTools ? ` activeTools:[${worker.activeTools.slice(0, 3).join(",")}${worker.activeTools.length > 3 ? "..." : ""}]` : "";
                     const isolation = worker.toolIsolationViolation ? ` isolation:${worker.toolIsolationViolation}` : "";
-                    const lane = worker.laneId ? ` lane:${worker.laneId.slice(-6)}` : "";
+                    const lane = worker.laneId ? ` lane:${worker.laneId.slice(0, 12)}…${worker.laneId.slice(-4)}` : "";
                     const roleTag = worker.roleId ? ` [${worker.roleId}]` : "";
                     const live = worker.status === "running" ? ` ${formatLivenessTag(worker.stale, liveness.get(worker.roleId))}` : "";
-                    return `${worker.status}${stale}${roleTag} ${worker.title} ${model}${thinking} ${elapsed} ${signal} ${worker.activity} events:${worker.eventCount}${usage}${output}${route}${fallback}${summary}${report}${captain}${cancelStatus}${exitInfo}${toolSummary}${activeToolSummary}${isolation}${lane}${live}`;
+                    return `${worker.status}${stale}${roleTag} ${worker.title} ${model}${thinking} ${elapsed} ${signal} ${worker.activity} events:${worker.eventCount}${toolCounts}${usage}${output}${route}${fallback}${summary}${report}${captain}${cancelStatus}${exitInfo}${toolSummary}${activeToolSummary}${isolation}${lane}${live}`;
                 })
                 .join("\n");
             return {
@@ -711,7 +776,7 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
                             `playbook: ${run.playbookId}`,
                             `fallback policy: ${run.fallbackPolicy ?? "task_first"}`,
                             `workers: total:${projection.counts.total} active:${projection.counts.active} succeeded:${projection.counts.succeeded} failed:${projection.counts.failed} degraded:${projection.counts.degraded} skipped:${projection.counts.skipped} stale:${projection.counts.stale}`,
-                            `signals: timedOut:${projection.counts.timedOut} parseErrors:${projection.counts.parseErrors} toolViolations:${projection.counts.toolViolations}`,
+                            `signals: timedOut:${projection.counts.timedOut} parseErrors:${projection.counts.parseErrors} toolViolations:${projection.counts.toolViolations} toolCalls:${projection.counts.toolCalls} toolErrors:${projection.counts.toolErrors}`,
                             `usage: req:${projection.counts.requests} tok:${projection.counts.tokens}${projection.counts.costUsd > 0 ? ` cost:$${projection.counts.costUsd.toFixed(4)}` : " cost:(none recorded)"}`,
                             `mailbox: ${projection.mailbox.file ?? "(none)"} messages:${projection.mailbox.messages}`,
                             `mailbox text: ${run.mailboxTextFile ?? "(none)"}`,
@@ -724,11 +789,11 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
                             `controls: ${projection.controls.join(", ") || "(none)"}`,
                             `evidence warnings: ${projection.evidenceWarnings.length > 0 ? projection.evidenceWarnings.join(" | ") : "(none)"}`,
                             run.delegationLanes && run.delegationLanes.length > 0
-                                ? `lanes: total:${run.delegationLanes.length} complete:${run.delegationLanes.filter((l) => l.ackState === "complete").length} partial:${run.delegationLanes.filter((l) => l.ackState === "partial").length} expired:${run.delegationLanes.filter((l) => l.ackState === "expired").length} invalid:${run.delegationLanes.filter((l) => l.ackState === "invalid").length}`
+                                ? `lanes: total:${run.delegationLanes.length} active:${run.delegationLanes.filter((l) => l.status === "active").length} succeeded:${run.delegationLanes.filter((l) => l.status === "succeeded").length} failed:${run.delegationLanes.filter((l) => l.status === "failed").length} skipped:${run.delegationLanes.filter((l) => l.status === "skipped").length} cancelled:${run.delegationLanes.filter((l) => l.status === "cancelled").length} ackComplete:${run.delegationLanes.filter((l) => l.ackState === "complete").length}`
                                 : undefined,
                             `model health: ${health || "(none recorded)"}`,
                             projection.counts.stale > 0
-                                ? `note: stale is not stuck — a worker composing a long answer is silent. Check live:progressing (usage grew since last poll) vs live:stuck (frozen). Only cancel genuinely stuck/frozen/runaway-cost workers.`
+                                ? `note: stale is not stuck — long composition can be silent. The runtime sends one attention follow-up only after sustained no-growth checks; do not repeatedly poll to measure time. Only cancel with corroborating frozen/runaway evidence.`
                                 : undefined,
                             workers || "(no workers)",
                         ]
@@ -886,14 +951,23 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
                     isError: true,
                 };
             }
-            const worker = resolveWorkerByKey(run.workers, roleId);
-            if (!worker) {
+            const resolution = resolveWorkerByKey(run.workers, roleId);
+            if (resolution.kind === "ambiguous") {
+                const candidates = resolution.candidates.map((candidate) => `${candidate.roleId} (${candidate.title})`).join(", ");
+                return {
+                    content: [{ type: "text", text: `Worker key ${roleId} is ambiguous in run ${runId}. Use an exact roleId: ${candidates}` }],
+                    details: { runId, roleId, candidates: resolution.candidates },
+                    isError: true,
+                };
+            }
+            if (resolution.kind === "not_found") {
                 return {
                     content: [{ type: "text", text: `Worker ${roleId} was not found in run ${runId}. Use team_status to list active roleIds.` }],
                     details: { runId, roleId },
                     isError: true,
                 };
             }
+            const worker = resolution.worker;
             // Continue with the worker's ACTUAL roleId, not the captain's input
             // spelling — the cancel file, guard message, and result must key off
             // the real id so the worker-side cancel check finds it.
@@ -910,8 +984,18 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
             if (!guard.ok) return { content: [{ type: "text", text: guard.message }], details: { runId, roleId: resolvedRoleId, runningCount: guard.runningCount, needsConfirm: true }, isError: true };
             const cancelFile = await requestWorkerCancel(ctx.cwd, runId, resolvedRoleId, reason);
             const matchNote = resolvedRoleId !== roleId ? ` (matched your input "${roleId}" to roleId "${resolvedRoleId}")` : "";
+            // Factual signal (not a gate, not a second confirm): if no worker has
+            // completed AND no other worker is still running, this cancel leaves
+            // the run with zero completed teammate output. State it so the
+            // captain cannot deliver a solo answer while unaware it is a
+            // fallback, not a team result. The judgment stays the captain's.
+            const anyCompleted = run.workers.some((w) => w.status === "succeeded" || w.status === "degraded");
+            const otherRunning = run.workers.some((w) => w.roleId !== resolvedRoleId && w.status === "running");
+            const fallbackNote = !anyCompleted && !otherRunning
+                ? ` This cancel will leave the run with no completed teammate output. If you deliver now, it is a captain fallback, not a team result — say so to the user.`
+                : "";
             return {
-                content: [{ type: "text", text: `Cancel requested for worker ${resolvedRoleId} in run ${runId}${matchNote}: ${cancelFile}. Cooperative stop: the worker ends after its current tool call finishes.` }],
+                content: [{ type: "text", text: `Cancel requested for worker ${resolvedRoleId} in run ${runId}${matchNote}: ${cancelFile}. Cooperative stop: the worker ends after its current tool call finishes.${fallbackNote}` }],
                 details: { runId, roleId: resolvedRoleId, cancelFile, reason },
             };
         },
@@ -938,9 +1022,19 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
             const run = await readTeamState(ctx.cwd, runId);
             if (!run) return { content: [{ type: "text", text: `Run ${runId} not found.` }], details: { runId }, isError: true };
             if (run.status !== "running") return { content: [{ type: "text", text: `Run ${runId} is ${run.status}.` }], details: { runId }, isError: true };
-            const role: PlannedRole = { roleId: params.roleId.trim(), title: params.title.trim(), description: params.title.trim(), capabilityNeeds: [], task: params.task.trim(), tools: params.tools ?? [], systemPrompt: `Spawned: ${params.title}`, modelPreferences: params.modelPreferences ?? [] };
+            const roleId = params.roleId.trim();
+            const title = params.title.trim();
+            const task = params.task.trim();
+            if (!roleId || !title || !task) {
+                return {
+                    content: [{ type: "text", text: "roleId, title, and task must be non-empty to request a worker spawn." }],
+                    details: { runId, roleId },
+                    isError: true,
+                };
+            }
+            const role: PlannedRole = { roleId, title, description: title, capabilityNeeds: [], task, tools: params.tools ?? [], systemPrompt: `Spawned: ${title}`, modelPreferences: params.modelPreferences ?? [] };
             await appendTeamMessage(ctx.cwd, runId, JSON.stringify({ action: "spawn_worker", role, at: Date.now() }), { system: true });
-            return { content: [{ type: "text", text: `Worker ${role.roleId} (${role.title}) spawned into run ${runId}.` }], details: { runId } };
+            return { content: [{ type: "text", text: `Worker ${role.roleId} (${role.title}) spawn requested into run ${runId}. Use team_status to confirm spawn-accepted or spawn-rejected.` }], details: { runId } };
         },
     });
 
@@ -962,8 +1056,34 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
                     isError: true,
                 };
             }
+            const run = await readTeamState(ctx.cwd, runId);
+            if (!run) {
+                return {
+                    content: [{ type: "text", text: `Team run ${runId} was not found.` }],
+                    details: { runId },
+                    isError: true,
+                };
+            }
+            const terminalStatuses = new Set(["succeeded", "failed", "degraded", "stopped"]);
+            if (terminalStatuses.has(run.status)) {
+                return {
+                    content: [{ type: "text", text: `Team run ${runId} is already ${run.status}. No cancel needed — the run has already finished.` }],
+                    details: { runId, status: run.status },
+                };
+            }
+            // Note: "canceled" is not a TeamRunStatus — captain-canceled runs are "stopped",
+            // already covered by terminalStatuses above. No separate canceled check needed.
             const reason = params.reason?.trim() || "captain requested cancellation";
-            const paths = await requestTeamCancel(ctx.cwd, runId, reason);
+            captainCanceledRuns.add(runId);
+            stopBackgroundAttentionMonitor(runId);
+            let paths: Awaited<ReturnType<typeof requestTeamCancel>>;
+            try {
+                paths = await requestTeamCancel(ctx.cwd, runId, reason);
+            } catch (error) {
+                captainCanceledRuns.delete(runId);
+                if (backgroundRunControllers.has(runId)) startBackgroundAttentionMonitor(ctx.cwd, runId);
+                throw error;
+            }
             // Cancel is an explicit captain intent, so respond in the UI right
             // away rather than waiting for the background run's Promise to settle.
             // Without this, a run canceled during probing / the decision window
@@ -974,7 +1094,6 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
             backgroundRunControllers.get(runId)?.abort();
             clearTeamUi(runId, ctx.hasUI ? ctx.ui : sessionUi);
             clearLiveness(runId);
-            captainCanceledRuns.add(runId);
             return {
                 content: [{ type: "text", text: `Cancel requested for ${runId}: ${paths.cancelFile}` }],
                 details: { runId, cancelFile: paths.cancelFile, reason },

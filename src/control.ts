@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { CONFIG_DIR_NAME } from "./runtime-compat.ts";
-import type { DelegationLaneState, TeamRun } from "./types.ts";
+import type { DelegationLaneState, TeamRun, WorkerRun } from "./types.ts";
 
 export interface TeamControlPaths {
     activeDir: string;
@@ -110,6 +110,16 @@ export async function initDelegationLane(
         ackState: "none",
         createdAt: Date.now(),
     };
+}
+
+export function finishDelegationLane(lane: DelegationLaneState, worker: WorkerRun): void {
+    lane.status = worker.cancelObservedAt
+        ? "cancelled"
+        : worker.status === "succeeded" || worker.status === "degraded"
+          ? "succeeded"
+          : worker.status === "failed"
+            ? "failed"
+            : "skipped";
 }
 
 export async function writeTeamState(cwd: string, run: TeamRun): Promise<void> {

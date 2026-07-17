@@ -112,6 +112,10 @@ export function buildWorkerInjection(
 
     // 2. Append captain-requested SOPs
     for (const sopId of sopIds) {
+        if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(sopId)) {
+            warnings.push(`SOP '${sopId}' has an invalid id — skipped`);
+            continue;
+        }
         const sopPath = path.join(manualsDir, "sop", `${sopId}.md`);
         const sop = loadManual(sopPath);
         if (!sop) {

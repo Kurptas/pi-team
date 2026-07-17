@@ -101,16 +101,24 @@ export function buildCaptainPreDelivery(
     const header =
         outcome.status === "failed"
             ? "## ⚠️  Captain Pre-Delivery: This team run FAILED — read the checklist below before you proceed."
-            : "## ⚠️  Captain Pre-Delivery: This team run is DEGRADED — read the checklist below before you proceed.";
+            : outcome.status === "stopped"
+              ? "## ⚠️  Captain Pre-Delivery: This team run was CAPTAIN-STOPPED — only partial teammate evidence may exist."
+              : "## ⚠️  Captain Pre-Delivery: This team run is DEGRADED — read the checklist below before you proceed.";
     const items = nonSucceeded.map((worker) => {
         const reason = worker.errorReason ?? "unknown reason";
-        const consequence = `Evidence missing from "${worker.title}" — this worker did not contribute usable findings.`;
+        const wasCaptainStopped = worker.status === "skipped" && (worker.errorReason === "aborted" || worker.cancelObservedAt !== undefined);
+        const consequence = wasCaptainStopped
+            ? `"${worker.title}" was stopped before a final teammate memo; preserve any partial/RADIO evidence separately and do not present the run as a complete team result.`
+            : `Evidence missing from "${worker.title}" — this worker did not contribute usable findings.`;
+        const action = wasCaptainStopped
+            ? "**Action required**: tell the user this perspective was captain-stopped, summarize any partial evidence, and explain whether you are retrying, waiting, or doing a captain fallback."
+            : "**Action required**: explicitly accept this gap, OR cancel/retry this worker, OR ask the user.";
         return [
             `### ${worker.title} (${worker.roleId}): ${worker.status}`,
             `- Model: ${worker.model ?? "(unassigned)"}`,
             `- Reason: ${reason}`,
             `- ${consequence}`,
-            `- **Action required**: explicitly accept this gap, OR cancel/retry this worker, OR ask the user.`,
+            `- ${action}`,
         ].join("\n");
     });
     const succeeded = workers.filter((worker) => worker.status === "succeeded");
@@ -331,16 +339,23 @@ export function determineTeamRunOutcome(workers: WorkerRun[], undispatchedCount 
     if (radioOnly.length > 0) warnings.push(`${radioOnly.length} worker(s) produced only RADIO progress reports`);
     if (streamParseErrors.length > 0)
         warnings.push(`${streamParseErrors.length} worker(s) had malformed event stream lines`);
+    const captainStopped = skipped.filter((worker) => worker.errorReason === "aborted" || worker.cancelObservedAt !== undefined);
     if (succeeded.length === 0) {
+        if (skipped.length > 0 && failed.length === 0 && captainStopped.length === skipped.length) {
+            warnings.push("captain stopped all workers before final teammate outputs; only partial/RADIO evidence may be available");
+            return { status: "stopped", warnings };
+        }
         if (skipped.length > 0) warnings.push("all workers were skipped or aborted; no usable teammate evidence");
         if (failed.length > 0) warnings.push("all workers failed; no usable teammate evidence");
         return { status: "failed", warnings };
     }
+    if (captainStopped.length > 0) warnings.push(`${captainStopped.length} worker(s) captain-stopped before final teammate output`);
     if (degraded.length > 0) warnings.push(`${degraded.length} worker(s) degraded (budget exceeded — partial results may be available)`);
     if (failed.length > 0 || skipped.length > 0 || degraded.length > 0) {
         if (failed.length > 0) warnings.push(`${failed.length} worker(s) failed`);
         if (degraded.length > 0) warnings.push(`${degraded.length} worker(s) degraded (budget exceeded)`);
-        if (skipped.length > 0) warnings.push(`${skipped.length} worker(s) skipped or aborted`);
+        const nonCaptainSkipped = skipped.length - captainStopped.length;
+        if (nonCaptainSkipped > 0) warnings.push(`${nonCaptainSkipped} worker(s) skipped or aborted`);
         return { status: "degraded", warnings };
     }
     return warnings.length > 0 ? { status: "degraded", warnings } : { status: "succeeded", warnings };

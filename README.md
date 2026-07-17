@@ -83,7 +83,7 @@ In practice: ask *one* model to review a pull request and it clears the change â
 
 ## You stay in the loop
 
-A team only helps if you can see it work and step in when it drifts. At any point you can check what each member is doing right now: which model, how long it's been running, what it's cost, whether it's genuinely working or stuck. You can nudge a member back on track, remove one from the team, or call the whole run off. Nothing runs away from you.
+A team only helps if you can see it work and step in when it drifts. Background runs are push-first: Pi tells you when the team finishes or when sustained silence needs your attention, instead of making you poll for progress. Inspect once, then nudge a member back on track, remove one from the team, or call the whole run off. Notifications never cancel or reroute workers for youâ€”the judgment stays yours.
 
 ## Going further
 

@@ -77,7 +77,7 @@ export function buildHandoffDigest(run: TeamRun): string {
             : "- (no evidence completeness recorded)",
         warnings.length > 0 ? `- warnings: ${warnings.join(" | ")}` : "- warnings: (none)",
         lanes.length > 0
-            ? `- delegation lanes: ${lanes.length} (complete:${lanes.filter((l) => l.ackState === "complete").length} partial:${lanes.filter((l) => l.ackState === "partial").length})`
+            ? `- delegation lanes: ${lanes.length} (active:${lanes.filter((l) => l.status === "active").length} succeeded:${lanes.filter((l) => l.status === "succeeded").length} failed:${lanes.filter((l) => l.status === "failed").length} ackComplete:${lanes.filter((l) => l.ackState === "complete").length})`
             : "- delegation lanes: (none)",
         "",
         "## Captain next step",

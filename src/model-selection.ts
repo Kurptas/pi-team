@@ -1,6 +1,5 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { taskThinkingLevel } from "./coding-thinking.ts";
 import { parseConfiguredModelPreference } from "./model-selector.ts";
 import type { FallbackPolicy, ModelHealthSnapshot, ModelProbeStatus, PlannedRole, ThinkingLevel } from "./types.ts";
 
@@ -58,10 +57,8 @@ export interface RoleModelCandidate {
     speed?: string;
     costTier?: string;
     warning?: string;
-    /** True only for genuine availability degradation (timeout / rate_limited /
-     * provider_error). probe_skipped is NOT degraded — it is unproven, and must
-     * stay in the healthy tier so we never re-rank a captain choice on a
-     * non-availability signal. */
+    /** True only when a recent real worker, not a synthetic probe, produced a
+     * soft availability failure. Probe soft failures remain advisory. */
     probeDegraded?: boolean;
     thinkingLevel?: ThinkingLevel;
     matchReason: string;
@@ -102,10 +99,9 @@ function cheapRecommendationKeys(doc: RecommendationsDoc | null): Set<string> {
 
 // Resolve the effective thinking level for a candidate, applying per-model
 // recommended thinking levels for coding roles.
-function effectiveThinkingLevel(role: PlannedRole, modelKey: string): ThinkingLevel | undefined {
-    if (role.capabilityNeeds.includes("coding")) {
-        return taskThinkingLevel(modelKey, "coding") ?? role.thinkingLevel;
-    }
+function effectiveThinkingLevel(role: PlannedRole): ThinkingLevel | undefined {
+    // No model-name rules here. The planner supplies task-level intent; the
+    // selected model's thinkingLevelMap handles transport compatibility later.
     return role.thinkingLevel;
 }
 
@@ -134,7 +130,7 @@ export function selectModelsToProbe(
         warnings.push("cheap_only fallbackPolicy 不使用过期推荐元数据判断低成本模型；等待 captain/用户显式选择或更新推荐表。");
     }
     if (directDispatch) {
-        warnings.push("direct-dispatch 直通档：captain 已为每个 role 明确指定模型，仅探测这些指定模型是否存活，跳过推荐表/fallback 候选扩展。");
+        warnings.push("direct-dispatch 直通档：captain 已为每个 role 明确指定首选模型；仅探测首选，fallback 候选保留为懒重试。");
     }
 
     for (const role of roles) {
@@ -151,7 +147,8 @@ export function selectModelsToProbe(
             }
             const model = configured.find((m) => m.key === parsed.model) ?? configured.find((m) => m.id === parsed.model);
             if (!model) continue;
-            candidates.push({ key: model.key, source: "user", thinkingLevel: parsed.thinkingLevel ?? effectiveThinkingLevel(role, model.key), matchReason: parsed.thinkingLevel ? `用户指定偏好; thinking=${parsed.thinkingLevel}` : "用户指定偏好" });
+            const thinkingLevel = effectiveThinkingLevel(role) ?? parsed.thinkingLevel;
+            candidates.push({ key: model.key, source: "user", thinkingLevel, matchReason: thinkingLevel ? `用户指定偏好; thinking=${thinkingLevel}` : "用户指定偏好" });
             added.add(model.key);
         }
 
@@ -165,12 +162,9 @@ export function selectModelsToProbe(
         const MIN_CANDIDATES = 3;
 
         // ---- Level 2: recommendation table ----
-        // Runs when there is no primary candidate, OR (non-strict) to top up
-        // healthy backups behind a user preference. Direct-dispatch skips this:
-        // the captain fully specified per-role models, so we probe ONLY those
-        // (no recommendation/fallback expansion) — a channel confirming the
-        // captain's exact choices is alive, not a re-selection.
-        if (!directDispatch && !blockedByStrictPolicy && !stale && recommendations && (candidates.length === 0 || wantBackup)) {
+        // Build lazy backups behind the primary candidate. Probe scope is
+        // decided separately below, so backups do not cost startup time.
+        if (!blockedByStrictPolicy && !stale && recommendations && (candidates.length === 0 || wantBackup)) {
             const recs = recommendations.recommendations
                 .filter((entry) => entry.roles.includes(role.roleId))
                 .filter((entry) => configuredSet.has(entry.key))
@@ -187,8 +181,8 @@ export function selectModelsToProbe(
                     strength: rec.strength,
                     speed: rec.speed,
                     costTier: rec.costTier,
-                    thinkingLevel: effectiveThinkingLevel(role, rec.key),
-                    matchReason: [`推荐#${rec.rank}`, rec.strength, `速度:${rec.speed}`, `成本:${rec.costTier}`, effectiveThinkingLevel(role, rec.key) ? `thinking=${effectiveThinkingLevel(role, rec.key)}` : "", stale ? "(数据已过期)" : ""].filter(Boolean).join("; "),
+                    thinkingLevel: effectiveThinkingLevel(role),
+                    matchReason: [`推荐#${rec.rank}`, rec.strength, `速度:${rec.speed}`, `成本:${rec.costTier}`, effectiveThinkingLevel(role) ? `thinking=${effectiveThinkingLevel(role)}` : "", stale ? "(数据已过期)" : ""].filter(Boolean).join("; "),
                 });
                 added.add(rec.key);
             }
@@ -205,7 +199,7 @@ export function selectModelsToProbe(
             candidates.push({
                 key: defaultModel.key,
                 source: "user_default",
-                thinkingLevel: effectiveThinkingLevel(role, defaultModel.key),
+                thinkingLevel: effectiveThinkingLevel(role),
                 matchReason: recommendations && !stale
                     ? "配置默认模型（无角色匹配的推荐元数据）"
                     : "配置默认模型（推荐数据缺失或过期）",
@@ -214,8 +208,8 @@ export function selectModelsToProbe(
         }
 
         // ---- Level 3: fallback — fills remaining slots up to MIN_CANDIDATES ----
-        // Skipped under direct-dispatch for the same reason as Level 2.
-        if (!directDispatch && fallbackPolicy !== "strict" && candidates.length < MIN_CANDIDATES) {
+        // These are retained for lazy worker retry but are not eagerly probed.
+        if (fallbackPolicy !== "strict" && candidates.length < MIN_CANDIDATES) {
             const fallbackModels = fallbackPolicy === "cheap_only"
                 ? configured.filter((model) => cheapKeys.has(model.key))
                 : configured;
@@ -225,7 +219,7 @@ export function selectModelsToProbe(
             for (const model of fallbackModels) {
                 if (candidates.length >= MIN_CANDIDATES) break;
                 if (added.has(model.key)) continue;
-                candidates.push({ key: model.key, source: "fallback", thinkingLevel: effectiveThinkingLevel(role, model.key), matchReason: [fallbackPolicy === "cheap_only" ? "cheap_only 策略低成本降级" : "无推荐匹配，从配置中选取", effectiveThinkingLevel(role, model.key) ? `thinking=${effectiveThinkingLevel(role, model.key)}` : ""].filter(Boolean).join("; ") });
+                candidates.push({ key: model.key, source: "fallback", thinkingLevel: effectiveThinkingLevel(role), matchReason: [fallbackPolicy === "cheap_only" ? "cheap_only 策略低成本降级" : "无推荐匹配，从配置中选取", effectiveThinkingLevel(role) ? `thinking=${effectiveThinkingLevel(role)}` : ""].filter(Boolean).join("; ") });
                 added.add(model.key);
             }
         }
@@ -233,9 +227,10 @@ export function selectModelsToProbe(
         rolePlans.push({ roleId: role.roleId, title: role.title, candidates, failedUserPreferences });
     }
 
-    // Deduplicate: only probe models that actually appear in any role's candidate list
-    const allCandidateKeys = new Set(rolePlans.flatMap((p) => p.candidates.map((c) => c.key)));
-    const modelsToProbe = configured.filter((m) => allCandidateKeys.has(m.key));
+    // Probe only each role's primary candidate. Backups remain in the role plan
+    // and are selected/retried lazily if the primary probe or real worker fails.
+    const primaryCandidateKeys = new Set(rolePlans.map((plan) => plan.candidates[0]?.key).filter((key): key is string => Boolean(key)));
+    const modelsToProbe = configured.filter((model) => primaryCandidateKeys.has(model.key));
 
     return {
         models: modelsToProbe,
@@ -255,19 +250,24 @@ function probeIsHardFail(status: ModelProbeStatus | undefined): boolean {
     return status === "missing_auth" || status === "model_rejected";
 }
 
-// Genuine availability degradation that should sink a candidate below healthy
-// peers. probe_skipped is NOT degraded (it is "unproven", not "unavailable")
-// and must stay in the healthy tier per the routing contract.
+// Soft availability statuses. The caller combines these with evidenceSource:
+// synthetic probes warn only; real worker failures may affect routing.
 function probeIsDegraded(status: ModelProbeStatus | undefined): boolean {
     return status === "timeout" || status === "rate_limited" || status === "provider_error";
 }
 
-function probeWarning(status: ModelProbeStatus | undefined, reason?: string): string | undefined {
-    if (!status || status === "probe_passed") return undefined;
+function probeWarning(
+    status: ModelProbeStatus | undefined,
+    reason?: string,
+    source: ModelHealthSnapshot["evidenceSource"] = "probe",
+): string | undefined {
+    if (status === undefined) return "未探测（懒 fallback）";
+    if (status === "probe_passed") return undefined;
     if (status === "probe_skipped") return "未探测";
-    if (status === "timeout") return `探测超时`;
-    if (status === "provider_error") return `探测错误: ${reason?.slice(0, 60) ?? ""}`;
-    return `探测状态: ${status}`;
+    const label = source === "worker" ? "最近真实执行" : "探测";
+    if (status === "timeout") return `${label}超时`;
+    if (status === "provider_error") return `${label}错误: ${reason?.slice(0, 60) ?? ""}`;
+    return `${label}状态: ${status}`;
 }
 
 export interface ResolvedRolePlan {
@@ -278,10 +278,8 @@ export interface ResolvedRolePlan {
     fallbackModels: string[];
     failedUserPreferences: string[];
     /**
-     * Configured user-preference models that probe-degraded and were demoted
-     * below a healthy backup. Surfaced so the caller can route them through the
-     * captain decision window instead of silently substituting an explicit
-     * choice on a soft probe signal.
+     * Configured preferences demoted after a fresh real-worker failure. Probe
+     * soft failures never populate this list.
      */
     degradedUserPreferences: string[];
     routingReason: string;
@@ -322,24 +320,18 @@ export function resolveProbeResults(
                 );
                 continue;
             }
-            const pw = probeWarning(snapshot?.status, snapshot?.reason);
+            const pw = probeWarning(snapshot?.status, snapshot?.reason, snapshot?.evidenceSource);
             workingCandidates.push({
                 ...candidate,
                 warning: pw,
-                probeDegraded: probeIsDegraded(snapshot?.status),
+                probeDegraded: probeIsDegraded(snapshot?.status) && snapshot?.evidenceSource === "worker",
                 matchReason: pw ? `${candidate.matchReason} (⚠️ ${pw})` : candidate.matchReason,
             });
         }
 
-        // Sort: probe health is an availability gate that outranks preference
-        // order. Only a genuinely degraded candidate (timeout / rate_limited /
-        // provider_error) is demoted; probe_passed AND probe_skipped (unproven,
-        // not unavailable) both stay in the healthy tier, so an auto-probed
-        // model never silently outranks an unprobed one. Within the same health
-        // tier we keep the intended preference order: explicit user choice >
-        // fresh role recommendation > configured-order fallback > broad fallback.
-        // This is an availability decision, not a quality judgment about which
-        // model is "better" — the captain still owns that.
+        // Synthetic timeout/rate/provider errors are advisory and never re-rank
+        // a captain choice. Only a fresh real-worker failure is strong enough to
+        // demote a candidate. Hard auth/model failures were removed above.
         workingCandidates.sort((a, b) => {
             const healthRank = (c: RoleModelCandidate) => (c.probeDegraded ? 1 : 0);
             const h = healthRank(a) - healthRank(b);
@@ -355,12 +347,9 @@ export function resolveProbeResults(
         const selectedThinkingLevel = selectedCandidate?.thinkingLevel;
         const fallbackModels = workingCandidates.slice(1, 4).map((c) => c.key);
 
-        // A configured user preference that probe-degraded and got demoted below
-        // a healthy backup is a *silent substitution* of an explicit choice. We
-        // surface those keys so the caller can route them through the captain
-        // decision window instead of auto-substituting — the captain may insist
-        // on the degraded model or accept the backup. (If the selected model IS
-        // the degraded user candidate, no substitution happened.)
+        // A recent real worker failure may demote an explicit preference. Surface
+        // that substitution for a captain decision; synthetic probe soft failures
+        // never reach this branch.
         const degradedUserPreferences = workingCandidates
             .filter((c) => (c.source === "user" || c.source === "user_default") && c.probeDegraded && c.key !== selectedModel)
             .map((c) => c.key);
@@ -370,11 +359,9 @@ export function resolveProbeResults(
             if (plan.failedUserPreferences.length > 0) {
                 roleWarnings.push(`用户指定模型不可用: ${plan.failedUserPreferences.join(", ")}`);
             }
-        } else if (selectedCandidate?.warning) {
-            // Every candidate is probe-degraded; we still dispatch the best one
-            // but flag that no probe-healthy model was available for the role.
+        } else if (selectedCandidate?.probeDegraded && selectedCandidate.warning) {
             roleWarnings.push(
-                `所有候选模型探测均未通过，已选择 ${selectedCandidate.key}（${selectedCandidate.warning}）；captain 可改派或重试`,
+                `所有候选模型最近真实执行均失败，仍选择 ${selectedCandidate.key}（${selectedCandidate.warning}）；captain 可改派或重试`,
             );
         }
 
@@ -397,7 +384,7 @@ export function resolveProbeResults(
                   policyReason,
                   workingCandidates
                       .slice(0, 3)
-                      .map((c) => `${c.source === "recommendation" ? `推荐#${c.recommendationRank ?? "?"}` : c.source === "user_default" ? "默认模型" : c.source}: ${c.key}${c.warning ? ` (⚠️)` : ""}`)
+                      .map((c) => `${c.source === "recommendation" ? `推荐#${c.recommendationRank ?? "?"}` : c.source === "user_default" ? "默认模型" : c.source}: ${c.key}${c.warning ? ` (⚠️ ${c.warning})` : ""}`)
                       .join(" | "),
               ].join("; ")
             : hardFailedModels.length > 0

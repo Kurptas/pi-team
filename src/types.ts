@@ -39,7 +39,7 @@ export type WorkerStatus = "pending" | "running" | "succeeded" | "failed" | "deg
 
 export type WorkerOutputKind = "empty" | "radio_only" | "substantive";
 
-export type TeamRunStatus = "planning" | "probing" | "running" | "synthesizing" | "succeeded" | "degraded" | "failed";
+export type TeamRunStatus = "planning" | "probing" | "running" | "synthesizing" | "succeeded" | "degraded" | "stopped" | "failed";
 
 export type ModelProbeStatus =
     | "probe_passed"
@@ -254,6 +254,8 @@ export interface ModelHealthSnapshot {
     model: string;
     provider: string;
     status: ModelProbeStatus;
+    /** Synthetic probes are advisory on soft failures; real worker outcomes may affect routing. */
+    evidenceSource?: "probe" | "worker";
     latencyMs: number;
     reason?: string;
     checkedAt: number;

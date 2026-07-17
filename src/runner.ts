@@ -7,6 +7,7 @@ import { persistBlueprintArtifact } from "./blueprint-store.ts";
 import { validateTeamPlanGraph } from "./plan-graph.ts";
 import { initialQueue, newlySchedulableRounds, undispatchedRounds } from "./plan-schedule.ts";
 import { validateSpawnRole } from "./spawn-validate.ts";
+import { runModelDecisionWindow, type PendingModelDecision } from "./model-decision-window.ts";
 import { buildHandoffDigest, writeHandoff } from "./handoff.ts";
 import { dispatchRound, type RoundDispatchContext } from "./round-dispatcher.ts";
 import { applyToolTierCeiling, formatToolTierDecision, resolveMaxToolTier } from "./tool-approval.ts";
@@ -16,7 +17,10 @@ import { resolveWorkerSessionManager, workerSessionId } from "./worker-session.t
 export { resolveWorkerSessionManager, workerSessionId } from "./worker-session.ts";
 import { findToolIsolationViolations, toolIsolationViolationMessage } from "./tool-isolation.ts";
 import { workerSessionToolOptions } from "./runtime-compat.ts";
+import { resolveThinkingCompatibility } from "./thinking-compat.ts";
+import { recordRunWorkerHealth } from "./model-health-cache.ts";
 import { writeWorkerArtifacts } from "./worker-artifacts.ts";
+import { detectModelConvergence } from "./notify-gating.ts";
 import { evaluateWorkerStructuredOutput } from "./structured-output.ts";
 import {
     RADIO_REPORT_PREFIX,
@@ -47,6 +51,7 @@ import { budgetNotice, classifyBudgetState, requestBudget, salvageOutput, select
 import {
     isTeamCancelRequested,
     isWorkerCancelRequested,
+    finishDelegationLane,
     initDelegationLane,
     prepareTeamControl,
     readTeamMailbox,
@@ -55,7 +60,6 @@ import {
     writeTeamState,
 } from "./control.ts";
 import type {
-    FallbackPolicy,
     PlannedRole,
     PlannedRound,
     TeamEvent,
@@ -108,7 +112,8 @@ type WorkerUpdate = (worker: WorkerRun, event: TeamEvent) => void;
 export interface TeamRunOptions {
     inheritedTools: string[];
     modelRegistry?: { find(provider: string, modelId: string): Model<import("@earendil-works/pi-ai").Api> | undefined };
-    pendingModelDecision?: { failedPrefs: string[]; configuredKeys: string[]; deadlineAt: number; policy?: FallbackPolicy };
+    pendingModelDecision?: PendingModelDecision;
+    modelDiversity?: { healthyModelCount: number; intendedDistinctModelCount: number };
     /** Extension defaults dir; used only to fall back to the bundled WATCHDOG template when no user/project file exists. */
     defaultsDir?: string;
 }
@@ -277,7 +282,7 @@ async function runWorker(
             title: role.title,
             task: role.task,
             model: role.selectedModel,
-            thinkingLevel: role.thinkingLevel ?? "medium",
+            thinkingLevel: role.thinkingLevel,
             status: "skipped",
             output: "",
             tools,
@@ -292,22 +297,21 @@ async function runWorker(
     let seenCaptainMessages = 0;
     const workerSessionIdStr = workerSessionId(runId, role.roleId);
     const workerModel = resolveWorkerModel(role.selectedModel, modelRegistry);
+    const thinking = resolveThinkingCompatibility(role.thinkingLevel, workerModel);
+    const effectiveRoutingReason = [role.routingReason, thinking.note].filter(Boolean).join("; ") || undefined;
     const budget = requestBudget();
     const runningWorker: WorkerRun = {
         roleId: role.roleId,
         title: role.title,
         task: role.task,
-        model: role.selectedModel,
-        thinkingLevel: role.thinkingLevel ?? "medium",
+        model: role.selectedModel, thinkingLevel: thinking.effective, routingReason: effectiveRoutingReason,
         status: "running",
         output: "",
         tools,
         startedAt: Date.now(),
         lastSignalAt: Date.now(),
         lastEvent: "worker-start",
-        requests: 0,
-        tokens: 0,
-        costUsd: 0,
+        requests: 0, tokens: 0, costUsd: 0,
         events: [],
     };
     const emitWorkerUpdate = (event: TeamEvent) => {
@@ -351,7 +355,7 @@ async function runWorker(
         const sessionReady = createAgentSession({
             cwd,
             model: workerModel,
-            thinkingLevel: role.thinkingLevel ?? "medium",
+            thinkingLevel: thinking.effective,
             ...workerSessionToolOptions(tools),
             sessionManager,
         });
@@ -634,8 +638,8 @@ async function runWorker(
             roleId: role.roleId,
             title: role.title,
             task: role.task,
-            model: role.selectedModel, thinkingLevel: role.thinkingLevel ?? "medium",
-            routingReason: role.routingReason, modelFallbackKeys: role.modelFallbackKeys,
+            model: role.selectedModel, thinkingLevel: runningWorker.thinkingLevel,
+            routingReason: runningWorker.routingReason, modelFallbackKeys: role.modelFallbackKeys,
             status,
             output,
             tools,
@@ -683,8 +687,8 @@ async function runWorker(
             roleId: role.roleId,
             title: role.title,
             task: role.task,
-            model: role.selectedModel, thinkingLevel: role.thinkingLevel ?? "medium",
-            routingReason: role.routingReason, modelFallbackKeys: role.modelFallbackKeys,
+            model: role.selectedModel, thinkingLevel: runningWorker.thinkingLevel,
+            routingReason: runningWorker.routingReason, modelFallbackKeys: role.modelFallbackKeys,
             status: caughtStatus,
             output: caughtOutput,
             tools,
@@ -898,67 +902,24 @@ export async function runTeamPlan(
         await stateWriter.flush();
         return persistedRun;
     }
-
-    // Captain decision window (runs in the background process so the captain's
-    // team_message can actually reach the mailbox before workers dispatch).
     const pending = options.pendingModelDecision;
-    if (pending) {
-        currentRun = updateAndPersist({
-            phase: "model-decision-window-start",
-            message: `user preference(s) unavailable: ${pending.failedPrefs.join(", ")}; captain may override via team_message before ${new Date(pending.deadlineAt).toISOString()}. ${pending.policy === "strict" ? "On timeout, strict policy skips the affected role(s) (no substitution)." : "Auto-fallback applies on timeout."}`,
-            status: currentRun.status,
-        });
-        // Only the system notice exists in the mailbox at window start; we ignore
-        // system-origin messages so the notice can never self-match. A real
-        // captain override arrives as a non-system team_message.
-        let overrideApplied = false;
-        while (Date.now() < pending.deadlineAt && !signal?.aborted) {
-            const captainMessages = (await readTeamMailbox(cwd, currentRun.runId)).filter((msg) => !msg.system);
-            const decisionMsg = captainMessages.find((msg) =>
-                pending.configuredKeys.some((key) => msg.message.includes(key)),
-            );
-            if (decisionMsg) {
-                const chosen = pending.configuredKeys.find((key) => decisionMsg.message.includes(key));
-                if (chosen) {
-                    let overriddenRoles = 0;
-                    for (const round of plan.rounds) {
-                        for (const role of round.roles) {
-                            if (role.modelPreferences.some((pref) => pending.failedPrefs.includes(pref))) {
-                                role.selectedModel = chosen;
-                                overriddenRoles += 1;
-                            }
-                        }
-                    }
-                    overrideApplied = overriddenRoles > 0;
-                    currentRun = updateAndPersist({
-                        phase: "model-decision-window-override",
-                        message: `captain selected ${chosen}; applied to ${overriddenRoles} affected role(s)`,
-                        status: currentRun.status,
-                    });
-                    break;
-                }
-            }
-            await new Promise((resolve) => setTimeout(resolve, 1_000));
-        }
-        if (!overrideApplied) {
-            currentRun = updateAndPersist({
-                phase: "model-decision-window-timeout",
-                message: signal?.aborted
-                    ? `decision window aborted; no captain override applied`
-                    : pending.policy === "strict"
-                      ? `no captain override received in decision window; strict policy skips affected role(s)`
-                      : `no captain override received in decision window; proceeding with auto-fallback routing`,
-                status: currentRun.status,
-            });
-        }
+    if (pending) await runModelDecisionWindow(
+        plan,
+        pending,
+        async () => (await readTeamMailbox(cwd, currentRun.runId)).filter((message) => !message.system).map((message) => message.message),
+        (event) => { currentRun = updateAndPersist(event); },
+        signal,
+    );
+    if (pending && options.modelDiversity) {
+        const assignedModels = plan.rounds.flatMap((round) => round.roles).map((role) => role.selectedModel)
+            .filter((model): model is string => Boolean(model));
+        const { healthyModelCount, intendedDistinctModelCount } = options.modelDiversity;
+        const notice = detectModelConvergence(assignedModels, healthyModelCount, intendedDistinctModelCount);
+        if (notice) currentRun = updateAndPersist({ phase: "run-evidence-warning", message: notice, isError: true });
     }
-
     const runRole = async (role: PlannedRole): Promise<WorkerRun> => {
         const resolvedTools = resolveWorkerTools(role.tools, options.inheritedTools);
-        // Apply the user-set tool-tier ceiling (default exec = no restriction).
-        // Transparent + observable: tools above the ceiling are dropped before
-        // dispatch and the run records what was dropped. The captain still owns
-        // role.tools; this is a coarse user boundary, not a semantic judgment.
+        // Transparent user-set ceiling; captain still owns semantic tool choice.
         const tierDecision = applyToolTierCeiling(resolvedTools, maxToolTier);
         const tools = tierDecision.allowed;
         const tierSummary = formatToolTierDecision(role.title, tierDecision);
@@ -1041,7 +1002,7 @@ export async function runTeamPlan(
         currentRun = updateAndPersist(
             {
                 phase: "worker-start",
-                message: `${role.title} started; capability=${role.capability ?? role.description}; needs=${role.capabilityNeeds.join(",") || "none"}; modelFit=${role.modelFit ?? "not specified"}; thinking=${role.thinkingLevel ?? "medium"}; routing=${role.routingReason ?? "not recorded"}; tools=${tools.join(",") || "(none)"}`,
+                message: `${role.title} started; capability=${role.capability ?? role.description}; needs=${role.capabilityNeeds.join(",") || "none"}; modelFit=${role.modelFit ?? "not specified"}; thinking-requested=${role.thinkingLevel ?? "provider-default"}; routing=${role.routingReason ?? "not recorded"}; tools=${tools.join(",") || "(none)"}`,
                 roleId: role.roleId,
                 model: role.selectedModel,
                 status: "running",
@@ -1053,6 +1014,7 @@ export async function runTeamPlan(
         try {
             let attemptRole = role;
             const attempts: NonNullable<WorkerRun["modelAttempts"]> = [];
+            const priorAttemptEvents: TeamEvent[] = [];
             while (true) {
                 const result = await runWorker(
                     cwd,
@@ -1061,6 +1023,7 @@ export async function runTeamPlan(
                     tools,
                     (worker, event) => {
                         Object.assign(runningWorker, worker);
+                        runningWorker.events = [...priorAttemptEvents, ...(worker.events ?? [])];
                         activeWorkers.set(role.roleId, runningWorker);
                         currentRun = updateAndPersist(event, { ...currentRun, workers: visibleWorkers() });
                     },
@@ -1070,10 +1033,14 @@ export async function runTeamPlan(
                     watchdogAdvisory,
                     options.defaultsDir,
                 );
+                currentRun = recordRunWorkerHealth(currentRun, result);
                 attempts.push({ model: attemptRole.selectedModel, status: result.status, errorReason: result.errorReason });
                 const nextModel = selectRetryModel(attempts.map((attempt) => attempt.model), attemptRole.modelFallbackKeys);
                 if (!shouldRetryWorker(result) || !nextModel) {
-                    const finalResult = await writeWorkerArtifacts(cwd, currentRun.runId, { ...result, modelAttempts: attempts });
+                    const finalResult = await writeWorkerArtifacts(cwd, currentRun.runId, {
+                        ...result, events: [...priorAttemptEvents, ...(result.events ?? [])], modelAttempts: attempts,
+                    });
+                    finishDelegationLane(lane, finalResult);
                     activeWorkers.set(role.roleId, finalResult);
                     currentRun = updateAndPersist(
                         {
@@ -1087,6 +1054,7 @@ export async function runTeamPlan(
                     );
                     return finalResult;
                 }
+                priorAttemptEvents.push(...(result.events ?? []));
                 currentRun = updateAndPersist(
                     {
                         phase: "worker-model-retry",

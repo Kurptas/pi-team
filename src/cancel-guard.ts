@@ -17,14 +17,27 @@ function normalizeRoleKey(value: string): string {
 // design: exact roleId first (fast path), then normalized roleId/title. The
 // tolerant path must be UNIQUE; if two workers collapse to the same key, fail
 // closed rather than canceling the wrong teammate.
-export function resolveWorkerByKey(workers: WorkerRun[], key: string): WorkerRun | undefined {
+export type ResolvedWorker =
+    | { kind: "found"; worker: WorkerRun; matchedBy: "exact" | "roleId" | "title" }
+    | { kind: "ambiguous"; candidates: Array<{ roleId: string; title: string }> }
+    | { kind: "not_found" };
+
+export function resolveWorkerByKey(workers: WorkerRun[], key: string): ResolvedWorker {
     const exact = workers.find((w) => w.roleId === key);
-    if (exact) return exact;
+    if (exact) return { kind: "found", worker: exact, matchedBy: "exact" };
     const normalized = normalizeRoleKey(key);
     const matches = workers.filter(
         (w) => normalizeRoleKey(w.roleId) === normalized || normalizeRoleKey(w.title) === normalized,
     );
-    return matches.length === 1 ? matches[0] : undefined;
+    if (matches.length === 1) {
+        const worker = matches[0];
+        const matchedBy = normalizeRoleKey(worker.roleId) === normalized ? "roleId" : "title";
+        return { kind: "found", worker, matchedBy };
+    }
+    if (matches.length > 1) {
+        return { kind: "ambiguous", candidates: matches.map((w) => ({ roleId: w.roleId, title: w.title })) };
+    }
+    return { kind: "not_found" };
 }
 
 export type CancelWorkerGuard =

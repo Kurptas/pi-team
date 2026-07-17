@@ -4,13 +4,14 @@
 // the createSemanticPlan/createTeamPlan closure is not threaded through here.
 import { selectModelsToProbe, resolveProbeResults, type ConfiguredModel, type ProbeSet, type ResolvedProbeResult } from "./model-selection.ts";
 import { probeModels, type ProbeModel } from "./prober.ts";
+import { freshModelHealth, recordModelHealth } from "./model-health-cache.ts";
 import type { FallbackPolicy, ModelHealthSnapshot, PlannedRole, TeamModel, TeamPlan } from "./types.ts";
 
 export interface ProbeResult {
     probeSet: ProbeSet;
     modelHealth: ModelHealthSnapshot[];
     resolved: ResolvedProbeResult;
-    deadBlueprintModels: string[]; // probe-degraded or hard-failed models from the blueprint
+    deadBlueprintModels: string[]; // recent worker-failed or hard-failed blueprint models
 }
 
 export async function probePlan(
@@ -22,21 +23,26 @@ export async function probePlan(
     directDispatch: boolean,
     probe: ProbeModel,
     signal?: AbortSignal,
+    useHealthCache = true,
 ): Promise<ProbeResult> {
     const allRoles: PlannedRole[] = plan.rounds.flatMap((round) => round.roles);
     const probeSet = selectModelsToProbe(allRoles, configuredModels, defaultsDir, fallbackPolicy, directDispatch);
 
-    const candidatesToProbe = availableModels.filter((m) =>
-        probeSet.models.some((pm) => pm.key === `${m.provider}/${m.id}`),
+    const targetKeys = probeSet.models.map((model) => model.key);
+    const candidateKeys = new Set((probeSet.rolePlans ?? []).flatMap((role) => role.candidates.map((candidate) => candidate.key)));
+    const cachedHealth = useHealthCache ? freshModelHealth(candidateKeys) : [];
+    const cachedKeys = new Set(cachedHealth.map((snapshot) => snapshot.model));
+    const candidatesToProbe = availableModels.filter((model) =>
+        targetKeys.includes(`${model.provider}/${model.id}`) && !cachedKeys.has(`${model.provider}/${model.id}`),
     );
-    const modelHealth: ModelHealthSnapshot[] =
-        candidatesToProbe.length === 0
-            ? []
-            : await probeModels(candidatesToProbe, probe, signal);
+    const rawProbeHealth: ModelHealthSnapshot[] =
+        candidatesToProbe.length === 0 ? [] : await probeModels(candidatesToProbe, probe, signal);
+    const probedHealth = rawProbeHealth.map((snapshot) => ({ ...snapshot, evidenceSource: "probe" as const }));
+    if (useHealthCache) for (const snapshot of probedHealth) recordModelHealth(snapshot);
+    const modelHealth = [...cachedHealth, ...probedHealth];
 
     const resolved = resolveProbeResults(probeSet, modelHealth);
-    // Collect blueprint-suggested models that are now known-dead so the caller
-    // can pass them back to the semantic-planner as unavailable constraints (方案B).
+    // Only hard failures or recent real-worker failures become unavailable constraints.
     const dead = new Set<string>();
     for (const rolePlan of resolved.rolePlans) {
         for (const pref of rolePlan.failedUserPreferences) dead.add(pref);

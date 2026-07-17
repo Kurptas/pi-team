@@ -6,7 +6,7 @@ import type { TeamRun } from "./types.ts";
 const TEAM_WIDGET_VISIBLE_WORKERS = 3;
 
 export function isTerminalStatus(status: TeamRun["status"]): boolean {
-    return status === "succeeded" || status === "degraded" || status === "failed";
+    return status === "succeeded" || status === "degraded" || status === "stopped" || status === "failed";
 }
 
 export function durationLabel(seconds: number | undefined): string {
@@ -70,7 +70,7 @@ export function teamCountSummary(run: TeamRun, theme?: Theme): string {
 }
 
 export function compactTeamLine(run: TeamRun, theme: Theme): string {
-    const statusColor = run.status === "failed" ? "error" : run.status === "degraded" ? "warning" : isTerminalStatus(run.status) ? "success" : "accent";
+    const statusColor = run.status === "failed" ? "error" : run.status === "degraded" || run.status === "stopped" ? "warning" : isTerminalStatus(run.status) ? "success" : "accent";
     return `${theme.fg("toolTitle", theme.bold("team"))} ${theme.fg(statusColor, run.status)} ${theme.fg("dim", run.playbookId)} · ${teamCountSummary(run, theme)}`;
 }
 

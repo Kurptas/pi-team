@@ -93,17 +93,22 @@ export function clearLiveness(runId: string): void {
 
 /**
  * Compact liveness tag for a running worker's team_status line, e.g.
- * " live:progressing(Δtok:1234,Δreq:1)", " live:stuck(0/0 since 45s)", or
- * " live:active". Returns "" when there is no delta record.
+ * " live:progressing(Δtok:1234,Δreq:1)", " live:stuck(0/0 since 45s)",
+ * " live:active", or " live:first-poll". A first-poll delta has no sinceMs baseline, so the captain needs a second poll before judging liveness.
  */
 export function formatLivenessTag(stale: boolean, diff: LivenessDelta | undefined): string {
-    const dTok = diff?.deltaTokens ?? 0;
-    const dReq = diff?.deltaRequests ?? 0;
-    const dEvt = diff?.deltaEvents ?? 0;
+    if (diff === undefined || diff.sinceMs === undefined) {
+        // First poll — no baseline yet. Classifying as stuck/progressing
+        // would be premature. The captain needs a second poll to compare.
+        return " live:first-poll";
+    }
+    const dTok = diff.deltaTokens;
+    const dReq = diff.deltaRequests;
+    const dEvt = diff.deltaEvents;
     const state = classifyLiveness(stale, dTok, dReq, dEvt);
     if (state === "progressing") return ` live:progressing(\u0394tok:${dTok},\u0394req:${dReq})`;
     if (state === "stuck") {
-        const since = diff?.sinceMs === undefined ? "?" : Math.round(diff.sinceMs / 1000);
+        const since = diff.sinceMs !== undefined ? Math.round(diff.sinceMs / 1000) : "?";
         return ` live:stuck(0/0 since ${since}s)`;
     }
     return " live:active";

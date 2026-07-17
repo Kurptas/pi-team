@@ -7,7 +7,6 @@ import type { Message } from "@earendil-works/pi-ai";
 import { loadTeamResources } from "../src/loader.ts";
 import { isThinkingLevel, parseConfiguredModelPreference, parseModelPreference } from "../src/model-selector.ts";
 import { resolveProbeResults, selectModelsToProbe, type ConfiguredModel } from "../src/model-selection.ts";
-import { codingThinkingLevel, taskThinkingLevel } from "../src/coding-thinking.ts";
 import { routeTeamPlan } from "../src/model-router.ts";
 import { validateTeamPlanGraph } from "../src/plan-graph.ts";
 import { findToolIsolationViolations, toolIsolationViolationMessage } from "../src/tool-isolation.ts";
@@ -19,7 +18,7 @@ import { createInProcessProbe, defaultInProcessProbeTimeoutMs, defaultProbeTimeo
 import { probePlan } from "../src/plan-probe.ts";
 import { materializeFanoutRoles, resolveFanoutItems, resolveJsonPointer } from "../src/fanout.ts";
 import { onceDisposer, resolveWorkerSessionManager, staleThresholdMs } from "../src/runner.ts";
-import { completionPush, completionPushDelayMs, decisionWindowMs, detectModelConvergence, generateRunId, shouldPushCompletion, teamWidgetLines } from "../src/index.ts";
+import { completionPush, completionPushDelayMs, decisionWindowMs, detectModelConvergence, generateRunId, shouldDirectModelDispatch, shouldPushCompletion, teamWidgetLines } from "../src/index.ts";
 import { buildRunAbsorption, determineTeamRunOutcome } from "../src/run-outcome.ts";
 import { writeWorkerArtifacts } from "../src/worker-artifacts.ts";
 import { buildHandoffDigest, readHandoff, writeHandoff } from "../src/handoff.ts";
@@ -36,11 +35,12 @@ import {
     structuredOutputInstruction,
     validateStructuredOutputValue,
 } from "../src/structured-output.ts";
-import type { FanoutExpandConfig, ModelHealthSnapshot, PlannedRole, PlannedRound, TeamModel, TeamPlan, TeamRun, WorkerRun } from "../src/types.ts";
+import type { FanoutExpandConfig, ModelHealthSnapshot, PlannedRole, PlannedRound, TeamEvent, TeamModel, TeamPlan, TeamRun, WorkerRun } from "../src/types.ts";
 import { classifyLiveness, clearLiveness, formatLivenessTag, recordAndDiffLiveness } from "../src/worker-liveness.ts";
 import { initialQueue, newlySchedulableRounds, roundDepsSatisfied, undispatchedRounds } from "../src/plan-schedule.ts";
 import { validateSpawnRole } from "../src/spawn-validate.ts";
 import { guardCancelLastWorker, resolveWorkerByKey } from "../src/cancel-guard.ts";
+import { dispatchRound } from "../src/round-dispatcher.ts";
 import { markTeamObserved, readTeamObservation, teamControlPaths, writeTeamState } from "../src/control.ts";
 
 const testDir = path.dirname(fileURLToPath(import.meta.url));
@@ -476,9 +476,9 @@ describe("reliability helpers", () => {
     it("filters cheap_only recommendation candidates using explicit metadata", () => {
         const role = { ...modelRole(), roleId: "scout", title: "Scout" };
         const probeSet = selectModelsToProbe([role], configuredModels(), defaultsDir, "cheap_only");
-        expect(probeSet.models.map((model) => model.key)).toEqual([
-            "deepseek/deepseek-v4-flash",
-            "openai-codex/gpt-5.4-mini",
+        expect(probeSet.models.map((model) => model.key)).toEqual(["deepseek/deepseek-v4-flash"]);
+        expect(probeSet.rolePlans![0]!.candidates.map((candidate) => candidate.key)).toEqual([
+            "deepseek/deepseek-v4-flash", "openai-codex/gpt-5.4-mini",
         ]);
     });
 
@@ -499,10 +499,8 @@ describe("reliability helpers", () => {
 
     it("limits cheap_only fallback to low-cost fast candidates", () => {
         const probeSet = selectModelsToProbe([modelRole()], configuredModels(), defaultsDir, "cheap_only");
-        expect(probeSet.models.map((model) => model.key)).toEqual([
-            "deepseek/deepseek-v4-flash",
-            "openai-codex/gpt-5.4-mini",
-        ]);
+        expect(probeSet.models.map((model) => model.key)).toEqual(["deepseek/deepseek-v4-flash"]);
+        expect(probeSet.rolePlans![0]!.candidates).toHaveLength(2);
         const resolved = resolveProbeResults(probeSet, passingHealth(probeSet.models));
         expect(resolved.rolePlans[0]!.selectedModel).toBe("deepseek/deepseek-v4-flash");
         expect(resolved.rolePlans[0]!.fallbackModels).toEqual(["openai-codex/gpt-5.4-mini"]);
@@ -522,9 +520,9 @@ describe("reliability helpers", () => {
 
     it("keeps cheap_only from broad fallback when all cheap candidates hard-fail", () => {
         const probeSet = selectModelsToProbe([modelRole()], configuredModels(), defaultsDir, "cheap_only");
-        const health: ModelHealthSnapshot[] = probeSet.models.map((model) => ({
-            provider: model.provider,
-            model: model.key,
+        const health: ModelHealthSnapshot[] = probeSet.rolePlans![0]!.candidates.map((candidate) => ({
+            provider: candidate.key.split("/")[0],
+            model: candidate.key,
             status: "model_rejected",
             latencyMs: 1,
             checkedAt: 1,
@@ -535,30 +533,44 @@ describe("reliability helpers", () => {
         expect(resolved.rolePlans[0]!.policyReason).toContain("no keyword guessing");
     });
 
-    it("keeps task_first fallback broad for task completion", () => {
+    it("keeps task_first fallbacks available but probes only the primary candidate", () => {
         const probeSet = selectModelsToProbe([modelRole()], configuredModels(), defaultsDir, "task_first");
-        expect(probeSet.models.map((model) => model.key)).toEqual(configuredModels().map((model) => model.key));
+        expect(probeSet.models.map((model) => model.key)).toEqual(["ai-genesis-claude/claude-opus-4-8"]);
+        expect(probeSet.rolePlans![0]!.candidates).toHaveLength(3);
         const resolved = resolveProbeResults(probeSet, passingHealth(probeSet.models));
         expect(resolved.fallbackPolicy).toBe("task_first");
         expect(resolved.rolePlans[0]!.selectedModel).toBe("ai-genesis-claude/claude-opus-4-8");
+        expect(resolved.rolePlans[0]!.fallbackModels).toHaveLength(2);
     });
 
-    it("direct-dispatch probes ONLY captain-specified models (no recommendation/fallback expansion)", () => {
+    it("treats explicit multi-round role preferences as direct model dispatch", () => {
+        expect(shouldDirectModelDispatch({
+            task: "two rounds",
+            roles: [
+                { id: "evidence", title: "Evidence", modelPreferences: ["deepseek/deepseek-v4-flash"] },
+                { id: "merge", title: "Merge", modelPreferences: ["openai/gpt"], dependsOn: ["evidence"] },
+            ],
+        }, false)).toBe(true);
+        expect(shouldDirectModelDispatch({ task: "auto", roles: [{ title: "Auto" }] }, false)).toBe(false);
+        expect(shouldDirectModelDispatch({ task: "planned", roles: [{ title: "R", modelPreferences: ["p/m"] }] }, true)).toBe(false);
+    });
+
+    it("direct-dispatch probes only captain primaries while retaining lazy fallbacks", () => {
         const role = modelRole(["deepseek/deepseek-v4-flash"]);
         const probeSet = selectModelsToProbe([role], configuredModels(), defaultsDir, "task_first", true);
-        // Only the captain's one explicit model is probed — not the full pool.
         expect(probeSet.models.map((m) => m.key)).toEqual(["deepseek/deepseek-v4-flash"]);
-        expect(probeSet.rolePlans![0]!.candidates.map((c) => c.source)).toEqual(["user"]);
+        expect(probeSet.rolePlans![0]!.candidates[0]!.source).toBe("user");
+        expect(probeSet.rolePlans![0]!.candidates.length).toBeGreaterThan(1);
         expect(probeSet.warnings.some((w) => w.includes("direct-dispatch"))).toBe(true);
         const resolved = resolveProbeResults(probeSet, passingHealth(probeSet.models));
         expect(resolved.rolePlans[0]!.selectedModel).toBe("deepseek/deepseek-v4-flash");
     });
 
-    it("non-direct-dispatch keeps the broad candidate pool for the same role", () => {
+    it("non-direct-dispatch keeps lazy backups but probes only the primary model", () => {
         const role = modelRole(["deepseek/deepseek-v4-flash"]);
         const broad = selectModelsToProbe([role], configuredModels(), defaultsDir, "task_first", false);
-        // Default path tops up healthy backups beyond the single user pick.
-        expect(broad.models.length).toBeGreaterThan(1);
+        expect(broad.models.map((model) => model.key)).toEqual(["deepseek/deepseek-v4-flash"]);
+        expect(broad.rolePlans![0]!.candidates.length).toBeGreaterThan(1);
         expect(broad.warnings.some((w) => w.includes("direct-dispatch"))).toBe(false);
     });
 
@@ -729,32 +741,48 @@ describe("reliability helpers", () => {
         expect(selectRetryModel([], [])).toBeUndefined();
     });
 
-    it("demotes probe-degraded candidates below a healthy backup", () => {
-        // User asks for the flash model; probe times out on it. A healthy backup
-        // must outrank the unreachable preference so we never dispatch blind.
+    it("keeps an explicit primary selected after a soft probe timeout", () => {
+        // Synthetic liveness probes are advisory; fallback happens only after
+        // real work fails.
         const role = { ...modelRole(["deepseek/deepseek-v4-flash"]), roleId: "scout", title: "Scout" };
         const probeSet = selectModelsToProbe([role], configuredModels(), defaultsDir, "task_first");
-        // backup candidates are built behind the user preference
-        expect(probeSet.models.length).toBeGreaterThan(1);
-        const health: ModelHealthSnapshot[] = probeSet.models.map((model) => ({
-            provider: model.provider,
-            model: model.key,
-            status: model.key === "deepseek/deepseek-v4-flash" ? "timeout" : "probe_passed",
+        // backup candidates are built behind the user preference but probed lazily
+        expect(probeSet.models.map((model) => model.key)).toEqual(["deepseek/deepseek-v4-flash"]);
+        expect(probeSet.rolePlans![0]!.candidates.length).toBeGreaterThan(1);
+        const health: ModelHealthSnapshot[] = [{
+            provider: "deepseek",
+            model: "deepseek/deepseek-v4-flash",
+            status: "timeout",
             latencyMs: 1,
             checkedAt: 1,
-        }));
+        }];
+        const resolved = resolveProbeResults(probeSet, health);
+        expect(resolved.rolePlans[0]!.selectedModel).toBe("deepseek/deepseek-v4-flash");
+        expect(resolved.rolePlans[0]!.degradedUserPreferences).toEqual([]);
+        expect(resolved.rolePlans[0]!.routingReason).toContain("探测超时");
+    });
+
+    it("demotes a candidate after a fresh real-worker failure", () => {
+        const role = { ...modelRole(["deepseek/deepseek-v4-flash"]), roleId: "scout", title: "Scout" };
+        const probeSet = selectModelsToProbe([role], configuredModels(), defaultsDir, "task_first");
+        const health: ModelHealthSnapshot[] = [{
+            provider: "deepseek", model: "deepseek/deepseek-v4-flash", status: "provider_error",
+            evidenceSource: "worker", reason: "recent worker failure: provider returned 502", latencyMs: 1, checkedAt: 1,
+        }];
         const resolved = resolveProbeResults(probeSet, health);
         expect(resolved.rolePlans[0]!.selectedModel).not.toBe("deepseek/deepseek-v4-flash");
-        expect(resolved.rolePlans[0]!.selectedModel).toBeDefined();
+        expect(resolved.rolePlans[0]!.degradedUserPreferences).toContain("deepseek/deepseek-v4-flash");
+        expect(resolved.rolePlans[0]!.routingReason).toContain("最近真实执行错误");
     });
 
     it("selects a degraded model only when no healthy candidate exists and flags it", () => {
         const role = { ...modelRole(["deepseek/deepseek-v4-flash"]), roleId: "scout", title: "Scout" };
         const probeSet = selectModelsToProbe([role], configuredModels(), defaultsDir, "task_first");
-        const health: ModelHealthSnapshot[] = probeSet.models.map((model) => ({
-            provider: model.provider,
-            model: model.key,
+        const health: ModelHealthSnapshot[] = probeSet.rolePlans![0]!.candidates.map((candidate) => ({
+            provider: candidate.key.split("/")[0],
+            model: candidate.key,
             status: "timeout" as const,
+            evidenceSource: "worker" as const,
             latencyMs: 1,
             checkedAt: 1,
         }));
@@ -783,16 +811,16 @@ describe("reliability helpers", () => {
         expect(resolved.rolePlans[0]!.degradedUserPreferences).toEqual([]);
     });
 
-    it("surfaces a probe-degraded configured user preference for the decision window", () => {
-        // User explicitly chose flash; it probe-degrades; a healthy backup exists.
-        // We must NOT silently substitute — the demoted user key is surfaced so
-        // the captain decision window can ask before falling back.
+    it("surfaces a recent worker-failed preference for the decision window", () => {
+        // Real work failed on the explicit model; substituting a backup requires
+        // a visible captain decision.
         const role = { ...modelRole(["deepseek/deepseek-v4-flash"]), roleId: "scout", title: "Scout" };
         const probeSet = selectModelsToProbe([role], configuredModels(), defaultsDir, "task_first");
         const health: ModelHealthSnapshot[] = probeSet.models.map((model) => ({
             provider: model.provider,
             model: model.key,
             status: model.key === "deepseek/deepseek-v4-flash" ? "timeout" : "probe_passed",
+            evidenceSource: "worker" as const,
             latencyMs: 1,
             checkedAt: 1,
         }));
@@ -801,11 +829,8 @@ describe("reliability helpers", () => {
         expect(resolved.rolePlans[0]!.degradedUserPreferences).toContain("deepseek/deepseek-v4-flash");
     });
 
-    it("includes probe-degraded models in deadBlueprintModels (B3: replan must not reselect them)", async () => {
-        // A user preference that probe-degrades this round is surfaced as a
-        // degradedUserPreference. probePlan must fold those into
-        // deadBlueprintModels so the replan path does not reselect a model that
-        // just timed out / rate-limited.
+    it("does not mark a soft probe timeout as a dead blueprint model", async () => {
+        // Synthetic probe uncertainty must not rewrite the blueprint or route.
         const role = { ...modelRole(["deepseek/deepseek-v4-flash"]), roleId: "scout", title: "Scout" };
         const plan: TeamPlan = { ...basePlan(), rounds: [{ id: "r1", type: "parallel", roles: [role] }] };
         const cfg = configuredModels();
@@ -817,9 +842,9 @@ describe("reliability helpers", () => {
             checkedAt: 1,
         });
         const result = await probePlan(plan, cfg, teamModels(cfg), defaultsDir, "task_first", false, degradedProbe);
-        // sanity: the degraded user preference was demoted, not selected
-        expect(result.resolved.rolePlans[0]!.degradedUserPreferences).toContain("deepseek/deepseek-v4-flash");
-        expect(result.deadBlueprintModels).toContain("deepseek/deepseek-v4-flash");
+        expect(result.resolved.rolePlans[0]!.selectedModel).toBe("deepseek/deepseek-v4-flash");
+        expect(result.resolved.rolePlans[0]!.degradedUserPreferences).toEqual([]);
+        expect(result.deadBlueprintModels).not.toContain("deepseek/deepseek-v4-flash");
     });
 
     // ── 项3: configured default only after explicit preferences / fresh recommendations ──
@@ -853,13 +878,14 @@ describe("reliability helpers", () => {
         expect(candidates[0]!.key).toBe("deepseek/deepseek-v4-flash");
     });
 
-    it("surfaces a probe-degraded user_default preference in the decision window", () => {
+    it("surfaces a recent worker-failed user_default preference in the decision window", () => {
         const role = modelRole(); // no modelPreferences → gets user_default
         const probeSet = selectModelsToProbe([role], configuredModels(), defaultsDir, "task_first");
         const health: ModelHealthSnapshot[] = probeSet.models.map((model) => ({
             provider: model.provider,
             model: model.key,
             status: model.key === configuredModels()[0]!.key ? "timeout" : "probe_passed",
+            evidenceSource: "worker" as const,
             latencyMs: 1,
             checkedAt: 1,
         }));
@@ -869,47 +895,31 @@ describe("reliability helpers", () => {
         expect(resolved.rolePlans[0]!.degradedUserPreferences).toContain(configuredModels()[0]!.key);
     });
 
-    // ── 项4: coding model recommended thinking levels ──
+    // Thinking intent is role/mode-driven; no model-name defaults.
 
-    it("codingThinkingLevel returns correct values for known coding models", () => {
-        expect(codingThinkingLevel("deepseek/deepseek-v4-pro")).toBe("medium");
-        expect(codingThinkingLevel("deepseek/deepseek-v4-flash")).toBe("off");
-        expect(codingThinkingLevel("ai-genesis-claude/claude-opus-4-7")).toBe("high");
-        expect(codingThinkingLevel("ai-genesis-claude/claude-opus-4-8")).toBe("high");
-        expect(codingThinkingLevel("openai-codex/gpt-5.4")).toBe("medium");
-        expect(codingThinkingLevel("openai-codex/gpt-5.5")).toBe("medium");
-        expect(codingThinkingLevel("qwen/qwen3.6-plus")).toBe("medium");
-        expect(codingThinkingLevel("zhipu/glm-5.2")).toBe("medium");
-    });
-
-    it("codingThinkingLevel returns undefined for unknown models and sub-variants", () => {
-        expect(codingThinkingLevel("unknown/model-123")).toBeUndefined();
-        expect(codingThinkingLevel("openai-codex/gpt-5.4-mini")).toBeUndefined();
-        expect(codingThinkingLevel("openai-codex/gpt-5.5-nano")).toBeUndefined();
-        expect(codingThinkingLevel("")).toBeUndefined();
-    });
-
-    it("codingThinkingLevel does not match v4-flash when v4-pro is present", () => {
-        expect(codingThinkingLevel("deepseek/deepseek-v4-pro")).toBe("medium");
-        expect(codingThinkingLevel("deepseek/deepseek-v4-pro")).not.toBe("off");
-    });
-
-    it("applies coding thinking override for roles with coding capabilityNeeds", () => {
+    it("keeps explicit role thinking for coding roles", () => {
         const role: PlannedRole = {
             ...modelRole(),
             roleId: "coder",
             title: "Coder",
             capabilityNeeds: ["coding"],
-            thinkingLevel: "low", // role-level thinking should be overridden
+            thinkingLevel: "low",
         };
         const models = [
-            // Only deepseek-v4-flash in the configured pool → codingThinkingLevel returns "off"
             { key: "deepseek/deepseek-v4-flash", provider: "deepseek", id: "deepseek-v4-flash", name: "DS Flash" },
         ];
         const probeSet = selectModelsToProbe([role], models, defaultsDir, "task_first");
-        const candidates = probeSet.rolePlans![0]!.candidates;
-        // Coding thinking override should be "off" (from codingThinkingLevel), not "low" (from role)
-        expect(candidates[0]!.thinkingLevel).toBe("off");
+        expect(probeSet.rolePlans![0]!.candidates[0]!.thinkingLevel).toBe("low");
+    });
+
+    it("leaves unspecified coding thinking to the provider default", () => {
+        const role: PlannedRole = {
+            ...modelRole(), roleId: "coder-default", title: "Coder Default", capabilityNeeds: ["coding"],
+        };
+        const probeSet = selectModelsToProbe([role], [
+            { key: "provider/model", provider: "provider", id: "model", name: "Model" },
+        ], defaultsDir, "task_first");
+        expect(probeSet.rolePlans![0]!.candidates[0]!.thinkingLevel).toBeUndefined();
     });
 
     it("does not apply coding thinking override for non-coding roles", () => {
@@ -929,7 +939,7 @@ describe("reliability helpers", () => {
         expect(candidates[0]!.thinkingLevel).toBe("high");
     });
 
-    it("user preference thinking level takes priority over coding override", () => {
+    it("model preference thinking suffix applies when role thinking is unspecified", () => {
         const role: PlannedRole = {
             ...modelRole(["deepseek/deepseek-v4-flash:high"]),
             roleId: "coder",
@@ -940,25 +950,25 @@ describe("reliability helpers", () => {
             { key: "deepseek/deepseek-v4-flash", provider: "deepseek", id: "deepseek-v4-flash", name: "DS Flash" },
         ];
         const probeSet = selectModelsToProbe([role], models, defaultsDir, "task_first");
-        const candidates = probeSet.rolePlans![0]!.candidates;
-        // User explicitly requested "high" — that beats the coding default "off"
-        expect(candidates[0]!.thinkingLevel).toBe("high");
+        expect(probeSet.rolePlans![0]!.candidates[0]!.thinkingLevel).toBe("high");
+    });
+
+    it("explicit role thinking takes priority over coding model recommendations", () => {
+        const role: PlannedRole = {
+            ...modelRole(["deepseek/deepseek-v4-flash:low"]),
+            roleId: "coder",
+            title: "Coder",
+            capabilityNeeds: ["coding"],
+            thinkingLevel: "high",
+        };
+        const probeSet = selectModelsToProbe([role], [
+            { key: "deepseek/deepseek-v4-flash", provider: "deepseek", id: "deepseek-v4-flash", name: "DS Flash" },
+        ], defaultsDir, "task_first");
+        expect(probeSet.rolePlans![0]!.candidates[0]!.thinkingLevel).toBe("high");
     });
 });
 
 describe("task thinking level — review mode", () => {
-    it("taskThinkingLevel review mode returns per-model levels (bumped from coding)", () => {
-        // Review/analysis: flash→medium, pro→high (one tier above coding)
-        expect(taskThinkingLevel("deepseek/deepseek-v4-pro", "review")).toBe("high");
-        expect(taskThinkingLevel("deepseek/deepseek-v4-flash", "review")).toBe("medium");
-        expect(taskThinkingLevel("ai-genesis-claude/claude-opus-4-7", "review")).toBe("high");
-        expect(taskThinkingLevel("ai-genesis-claude/claude-opus-4-8", "review")).toBe("high");
-        expect(taskThinkingLevel("openai-codex/gpt-5.4", "review")).toBe("high");
-        expect(taskThinkingLevel("openai-codex/gpt-5.5", "review")).toBe("high");
-        expect(taskThinkingLevel("unknown/model-123", "review")).toBeUndefined();
-        expect(taskThinkingLevel("deepseek/deepseek-v4-pro", "coding")).toBe("medium"); // coding unchanged
-    });
-
     it("createTeamPlan mode=review sets thinking high, mode=research leaves undefined", () => {
         const resources = loadTeamResources(projectRoot, defaultsDir);
         const reviewPlan = createTeamPlan({
@@ -1492,37 +1502,33 @@ describe("configurable probe + decision-window timeouts (2026-07-02 fallback-gap
         expect(msg).toContain("team_status");
     });
 
-    it("shouldPushCompletion: observing a running run does not swallow the terminal reminder", () => {
-        // A terminal transition is distinct from mid-run progress. Polling once
-        // while the run is still running does not mean the captain will keep
-        // polling until completion.
-        expect(shouldPushCompletion(false, true, "succeeded")).toBe(true);
+    it("shouldPushCompletion: terminal success pushes until terminal status was observed", () => {
+        expect(shouldPushCompletion(false, "succeeded")).toBe(true);
     });
 
     it("shouldPushCompletion: observing the terminal success/degraded state suppresses duplicate noise", () => {
-        expect(shouldPushCompletion(false, true, "succeeded", true)).toBe(false);
-        expect(shouldPushCompletion(false, true, "degraded", true)).toBe(false);
+        expect(shouldPushCompletion(false, "succeeded", true)).toBe(false);
+        expect(shouldPushCompletion(false, "degraded", true)).toBe(false);
     });
 
     it("shouldPushCompletion: failed terminal runs push even if already observed", () => {
-        expect(shouldPushCompletion(false, true, "failed", true)).toBe(true);
+        expect(shouldPushCompletion(false, "failed", true)).toBe(true);
     });
 
     it("shouldPushCompletion: an unobserved terminal run pushes", () => {
-        expect(shouldPushCompletion(false, false, "succeeded")).toBe(true);
-        expect(shouldPushCompletion(false, false, "failed")).toBe(true);
+        expect(shouldPushCompletion(false, "succeeded")).toBe(true);
+        expect(shouldPushCompletion(false, "failed")).toBe(true);
     });
 
     it("shouldPushCompletion: a non-terminal (running) status does not push", () => {
         // Mid-run states are surfaced via team_status, not a wake-up push.
-        expect(shouldPushCompletion(false, false, "running")).toBe(false);
-        expect(shouldPushCompletion(false, true, "running")).toBe(false);
+        expect(shouldPushCompletion(false, "running")).toBe(false);
     });
 
     it("shouldPushCompletion: a canceled run never pushes, even if failed", () => {
         // The captain asked to cancel — they already know.
-        expect(shouldPushCompletion(true, false, "succeeded")).toBe(false);
-        expect(shouldPushCompletion(true, true, "failed")).toBe(false);
+        expect(shouldPushCompletion(true, "succeeded")).toBe(false);
+        expect(shouldPushCompletion(true, "failed")).toBe(false);
     });
 
     it("completionPushDelayMs: watched runs get a longer terminal grace window", () => {
@@ -1621,7 +1627,11 @@ describe("in-process probe", () => {
     it("resolves probe_passed when the fake session emits OK then agent_end", async () => {
         const registry = { find: () => fakeModel };
         let disposed = false;
-        const fakeFactory = async () => {
+        let probeThinking: unknown = "unset";
+        let hasThinkingProperty = true;
+        const fakeFactory = async (options: { thinkingLevel?: string }) => {
+            probeThinking = options.thinkingLevel;
+            hasThinkingProperty = Object.hasOwn(options, "thinkingLevel");
             const listeners: Array<(event: { type: string }) => void> = [];
             const session = {
                 subscribe(listener: (event: { type: string }) => void) {
@@ -1644,6 +1654,8 @@ describe("in-process probe", () => {
         const snapshot = await probe(probeModel);
         expect(snapshot.status).toBe("probe_passed");
         expect(disposed).toBe(true);
+        expect(probeThinking).toBeUndefined();
+        expect(hasThinkingProperty).toBe(false);
         expect(snapshot.model).toBe("acme/fast-1");
     });
 
@@ -1776,12 +1788,16 @@ describe("worker session resume (项2)", () => {
     });
 });
 
-describe("single-model convergence detection", () => {
+describe("model diversity reduction detection", () => {
     it("flags when >1 worker all route to the same model despite other healthy models", () => {
         const notice = detectModelConvergence(["a/claude", "a/claude", "a/claude"], 3);
-        expect(notice).toBeDefined();
-        expect(notice).toContain("3 worker(s)");
-        expect(notice).toContain("a/claude");
+        expect(notice).toContain("3 worker(s) use 1 distinct model(s)");
+    });
+
+    it("flags partial diversity collapse such as four roles using only two models", () => {
+        const notice = detectModelConvergence(["a/claude", "a/claude", "b/qwen", "b/qwen"], 4);
+        expect(notice).toContain("4 worker(s) use 2 distinct model(s)");
+        expect(notice).toContain("target of 4 healthy/requested model(s)");
     });
 
     it("does NOT flag a single worker", () => {
@@ -1792,9 +1808,13 @@ describe("single-model convergence detection", () => {
         expect(detectModelConvergence(["a/claude", "b/deepseek"], 3)).toBeUndefined();
     });
 
-    it("does NOT flag when no other healthy model existed to diversify to", () => {
-        // All on one model, but only one healthy model available — convergence is forced, not a choice.
-        expect(detectModelConvergence(["a/claude", "a/claude"], 1)).toBeUndefined();
+    it("does NOT flag when no other healthy or requested model existed", () => {
+        expect(detectModelConvergence(["a/claude", "a/claude"], 1, 1)).toBeUndefined();
+    });
+
+    it("flags collapse against captain-requested diversity even when probes undercount health", () => {
+        expect(detectModelConvergence(["a/claude", "a/claude", "b/qwen", "b/qwen"], 2, 4))
+            .toContain("target of 4 healthy/requested model(s)");
     });
 
     it("ignores empty assignment list", () => {
@@ -1994,11 +2014,103 @@ describe("worker liveness (项9)", () => {
         });
     });
     describe("formatLivenessTag", () => {
-        it("formats active, progressing, and stuck tags", () => {
-            expect(formatLivenessTag(false, undefined)).toBe(" live:active");
+        it("formats first-poll, active, progressing, and stuck tags", () => {
+            expect(formatLivenessTag(false, undefined)).toBe(" live:first-poll");
+            expect(formatLivenessTag(true, { deltaTokens: 0, deltaRequests: 0, deltaEvents: 0, sinceMs: undefined })).toBe(" live:first-poll");
+            expect(formatLivenessTag(false, { deltaTokens: 0, deltaRequests: 0, deltaEvents: 0, sinceMs: 5_000 })).toBe(" live:active");
             expect(formatLivenessTag(true, { deltaTokens: 1234, deltaRequests: 1, deltaEvents: 2, sinceMs: 5_000 })).toBe(" live:progressing(Δtok:1234,Δreq:1)");
             expect(formatLivenessTag(true, { deltaTokens: 0, deltaRequests: 0, deltaEvents: 0, sinceMs: 45_000 })).toBe(" live:stuck(0/0 since 45s)");
         });
+    });
+});
+
+describe("round dispatcher", () => {
+    const role = (roleId: string): PlannedRole => ({
+        roleId,
+        title: roleId.toUpperCase(),
+        description: `${roleId} role`,
+        capabilityNeeds: [],
+        task: `task ${roleId}`,
+        tools: [],
+        systemPrompt: `system ${roleId}`,
+        modelPreferences: [],
+    });
+    const worker = (roleId: string, output = `output ${roleId}`): WorkerRun => ({
+        roleId,
+        title: roleId.toUpperCase(),
+        task: `task ${roleId}`,
+        status: "succeeded",
+        output,
+        tools: [],
+    });
+    function context(runRole: (planned: PlannedRole) => Promise<WorkerRun>, initialWorkers: WorkerRun[] = []) {
+        const events: TeamEvent[] = [];
+        const workers = [...initialWorkers];
+        const activeWorkers = new Map<string, WorkerRun>();
+        const roundCompleted = new Map<string, WorkerRun>();
+        return {
+            events,
+            ctx: {
+                runRole,
+                workers,
+                activeWorkers,
+                roundCompleted,
+                visibleWorkers: () => workers,
+                updateAndPersist: (event: TeamEvent) => events.push(event),
+                maxConcurrency: 2,
+            },
+        };
+    }
+
+    it("dispatches a parallel round, records workers, and clears per-round state", async () => {
+        const roles = [role("a"), role("b")];
+        const seen: string[] = [];
+        const { ctx, events } = context(async (planned) => {
+            seen.push(planned.roleId);
+            return worker(planned.roleId);
+        });
+        ctx.activeWorkers.set("a", worker("a"));
+        ctx.activeWorkers.set("b", worker("b"));
+        const result = await dispatchRound({ id: "parallel", type: "parallel", roles }, ctx);
+        expect(seen.sort()).toEqual(["a", "b"]);
+        expect(result.map((item) => item.roleId)).toEqual(["a", "b"]);
+        expect(ctx.workers.map((item) => item.roleId)).toEqual(["a", "b"]);
+        expect(ctx.activeWorkers.size).toBe(0);
+        expect(ctx.roundCompleted.size).toBe(0);
+        expect(events.map((event) => event.phase)).toEqual([
+            "round-start", "round-progress", "round-progress", "round-end",
+        ]);
+    });
+
+    it("runs chain roles sequentially with prior teammate findings", async () => {
+        const seen: PlannedRole[] = [];
+        const { ctx } = context(async (planned) => {
+            seen.push(planned);
+            return worker(planned.roleId);
+        }, [worker("source", "seed evidence")]);
+        const result = await dispatchRound({ id: "chain", type: "chain", roles: [role("a"), role("b")] }, ctx);
+        expect(result.map((item) => item.roleId)).toEqual(["a", "b"]);
+        expect(seen.map((item) => item.roleId)).toEqual(["a", "b"]);
+        expect(seen[0]?.task).toContain("seed evidence");
+        expect(seen[1]?.task).toContain("output a");
+    });
+
+    it("aborts a fanout round cleanly when its upstream source is missing", async () => {
+        let calls = 0;
+        const { ctx, events } = context(async (planned) => {
+            calls += 1;
+            return worker(planned.roleId);
+        });
+        const result = await dispatchRound({
+            id: "fanout",
+            type: "fanout",
+            roles: [role("child")],
+            fanout: { expand: { fromRoleId: "missing", path: "/items", maxItems: 3 } },
+        }, ctx);
+        expect(result).toEqual([]);
+        expect(calls).toBe(0);
+        expect(events.at(-1)).toMatchObject({ phase: "round-end", message: "fanout completed" });
+        expect(events.some((event) => event.isError)).toBe(true);
     });
 });
 
@@ -2190,23 +2302,32 @@ describe("resolveWorkerByKey (cancel-guard)", () => {
     const workers = [wk("captain-surface-reviewer", "Captain Surface Product Reviewer"), wk("worker-collab-reviewer", "Worker Collaboration Reviewer")];
 
     it("matches the exact roleId (fast path)", () => {
-        expect(resolveWorkerByKey(workers, "captain-surface-reviewer")?.roleId).toBe("captain-surface-reviewer");
+        expect(resolveWorkerByKey(workers, "captain-surface-reviewer")).toMatchObject({
+            kind: "found",
+            matchedBy: "exact",
+            worker: { roleId: "captain-surface-reviewer" },
+        });
     });
     it("matches an underscore-spelled id the captain may have authored (regression: slug uses hyphens)", () => {
-        // This is the real friction hit in the 2026-07-08 product run: the
-        // captain passed captain_surface_reviewer but the slugified roleId is
-        // captain-surface-reviewer, so exact match failed and the cancel was lost.
-        expect(resolveWorkerByKey(workers, "captain_surface_reviewer")?.roleId).toBe("captain-surface-reviewer");
+        const result = resolveWorkerByKey(workers, "captain_surface_reviewer");
+        expect(result).toMatchObject({ kind: "found", matchedBy: "roleId", worker: { roleId: "captain-surface-reviewer" } });
     });
     it("matches by the human title as a fallback", () => {
-        expect(resolveWorkerByKey(workers, "Captain Surface Product Reviewer")?.roleId).toBe("captain-surface-reviewer");
+        const result = resolveWorkerByKey(workers, "Captain Surface Product Reviewer");
+        expect(result).toMatchObject({ kind: "found", matchedBy: "title", worker: { roleId: "captain-surface-reviewer" } });
     });
-    it("fails closed when a tolerant key is ambiguous", () => {
+    it("fails closed and reports candidates when a tolerant key is ambiguous", () => {
         const ambiguous = [wk("reviewer-a", "Reviewer"), wk("reviewer-b", "Reviewer")];
-        expect(resolveWorkerByKey(ambiguous, "reviewer")).toBeUndefined();
+        expect(resolveWorkerByKey(ambiguous, "reviewer")).toEqual({
+            kind: "ambiguous",
+            candidates: [
+                { roleId: "reviewer-a", title: "Reviewer" },
+                { roleId: "reviewer-b", title: "Reviewer" },
+            ],
+        });
     });
-    it("returns undefined when nothing plausibly matches", () => {
-        expect(resolveWorkerByKey(workers, "nonexistent-role")).toBeUndefined();
+    it("reports not_found when nothing plausibly matches", () => {
+        expect(resolveWorkerByKey(workers, "nonexistent-role")).toEqual({ kind: "not_found" });
     });
 });
 
@@ -2235,6 +2356,13 @@ describe("manual injection (manual-loader)", () => {
         const out = buildWorkerInjection(defaultsDir, ["does-not-exist"], warnings);
         expect(out).toContain("Worker Playbook");
         expect(warnings.some((w) => w.includes("does-not-exist"))).toBe(true);
+    });
+    it("rejects path-like SOP ids instead of rewriting them to another SOP", () => {
+        const warnings: string[] = [];
+        const out = buildWorkerInjection(defaultsDir, ["../captain/01-captain-manual"], warnings);
+        expect(out).toContain("Worker Playbook");
+        expect(out).not.toContain("Team Captain Manual");
+        expect(warnings).toContain("SOP '../captain/01-captain-manual' has an invalid id — skipped");
     });
     it("returns empty string when defaultsDir is undefined", () => {
         expect(buildWorkerInjection(undefined, ["code-review"], [])).toBe("");

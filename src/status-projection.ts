@@ -19,6 +19,7 @@ export function buildTeamStatusProjection(
     now = Date.now(),
 ) {
     const workers = (run.workers ?? []).map((worker) => {
+        const toolEvents = (worker.events ?? []).filter((event) => event.phase === "worker-tool");
         const signalAgeMs = worker.lastSignalAt === undefined ? undefined : Math.max(0, now - worker.lastSignalAt);
         const signalAgeSeconds = secondsSince(worker.lastSignalAt, now);
         const stale = worker.status === "running" && signalAgeMs !== undefined && signalAgeMs > TEAM_STATUS_STALE_MS;
@@ -51,6 +52,8 @@ export function buildTeamStatusProjection(
             tools: worker.tools,
             activeTools: worker.activeTools,
             toolIsolationViolation: worker.toolIsolationViolation,
+            toolCallCount: toolEvents.filter((event) => event.message.includes("tool_execution_start")).length,
+            toolErrorCount: toolEvents.filter((event) => event.isError === true).length,
             requests: worker.requests ?? 0,
             tokens: worker.tokens ?? 0,
             costUsd: worker.costUsd ?? 0,
@@ -78,6 +81,8 @@ export function buildTeamStatusProjection(
             timedOut: workers.filter((worker) => worker.timedOut).length,
             parseErrors: workers.reduce((sum, worker) => sum + worker.streamParseErrorCount, 0),
             toolViolations: workers.filter((worker) => !!worker.toolIsolationViolation).length,
+            toolCalls: workers.reduce((sum, worker) => sum + worker.toolCallCount, 0),
+            toolErrors: workers.reduce((sum, worker) => sum + worker.toolErrorCount, 0),
             requests: workers.reduce((sum, worker) => sum + worker.requests, 0),
             tokens: workers.reduce((sum, worker) => sum + worker.tokens, 0),
             costUsd: workers.reduce((sum, worker) => sum + worker.costUsd, 0),
@@ -94,10 +99,15 @@ export function buildTeamStatusProjection(
         modelHealth: (run.modelHealth ?? []).map((snapshot) => ({
             model: snapshot.model,
             status: snapshot.status,
+            evidenceSource: snapshot.evidenceSource,
             reason: snapshot.reason,
             latencyMs: snapshot.latencyMs,
         })),
-        controls: run.status === "running" ? ["team_message", "team_cancel"] : [],
+        controls: run.status === "running"
+            ? ["team_message", "team_cancel_worker", "team_spawn_worker", "team_cancel"]
+            : run.status === "planning" || run.status === "probing" || run.status === "synthesizing"
+              ? ["team_cancel"]
+              : ["team_handoff", "team_promote_blueprint"],
         stateWriteError: run.stateWriteError,
     };
 }
