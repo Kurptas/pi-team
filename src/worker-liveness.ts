@@ -1,10 +1,8 @@
 // Worker liveness tracking (backlog 项9): distinguish "silent but progressing"
-// from "frozen/stuck". A worker composing a long single message fires no session
-// events, so its signal age goes stale even though it is very much alive. The
-// reliable progress signal is whether tokens/requests/eventCount grew across two
-// team_status polls. This module tracks per-worker snapshots and computes deltas
-// so the captain gets better data before deciding to cancel. Pure observability —
-// no worker execution, cancel semantics, or stale threshold is changed here.
+// from "no recorded delta". A worker composing a long single message fires no
+// session events, so its signal age goes stale even though it may still be alive.
+// Token/request/event deltas across observations are corroborating evidence only.
+// This module never decides that a worker is stuck or changes execution.
 
 export interface LivenessSnapshot {
     tokens: number;
@@ -20,7 +18,7 @@ export interface LivenessDelta {
     sinceMs: number | undefined;
 }
 
-export type LivenessClass = "active" | "progressing" | "stuck";
+export type LivenessClass = "active" | "progressing" | "no_delta";
 
 // runId -> roleId -> last-poll snapshot.
 const livenessStore = new Map<string, Map<string, LivenessSnapshot>>();
@@ -73,7 +71,7 @@ export function recordAndDiffLiveness(
  * Classify liveness from the stale flag and per-poll deltas:
  * - not stale -> "active" (recent event signal, obviously alive)
  * - stale but any delta grew -> "progressing" (silent but advancing since last poll)
- * - stale and all deltas zero -> "stuck" (frozen; genuine cancel candidate)
+ * - stale and all deltas zero -> "no_delta" (factual signal, not a verdict)
  */
 export function classifyLiveness(
     stale: boolean,
@@ -83,7 +81,7 @@ export function classifyLiveness(
 ): LivenessClass {
     if (!stale) return "active";
     if (deltaTokens > 0 || deltaRequests > 0 || deltaEvents > 0) return "progressing";
-    return "stuck";
+    return "no_delta";
 }
 
 /** Drop a run's snapshots. Call when a run terminates to avoid leaking state. */
@@ -93,13 +91,12 @@ export function clearLiveness(runId: string): void {
 
 /**
  * Compact liveness tag for a running worker's team_status line, e.g.
- * " live:progressing(Δtok:1234,Δreq:1)", " live:stuck(0/0 since 45s)",
- * " live:active", or " live:first-poll". A first-poll delta has no sinceMs baseline, so the captain needs a second poll before judging liveness.
+ * " live:progressing(Δtok:1234,Δreq:1)", " live:no-delta(0/0 since 45s)",
+ * " live:active", or " live:first-poll".
  */
 export function formatLivenessTag(stale: boolean, diff: LivenessDelta | undefined): string {
     if (diff === undefined || diff.sinceMs === undefined) {
-        // First poll — no baseline yet. Classifying as stuck/progressing
-        // would be premature. The captain needs a second poll to compare.
+        // First observation has no comparison baseline.
         return " live:first-poll";
     }
     const dTok = diff.deltaTokens;
@@ -107,9 +104,9 @@ export function formatLivenessTag(stale: boolean, diff: LivenessDelta | undefine
     const dEvt = diff.deltaEvents;
     const state = classifyLiveness(stale, dTok, dReq, dEvt);
     if (state === "progressing") return ` live:progressing(\u0394tok:${dTok},\u0394req:${dReq})`;
-    if (state === "stuck") {
+    if (state === "no_delta") {
         const since = diff.sinceMs !== undefined ? Math.round(diff.sinceMs / 1000) : "?";
-        return ` live:stuck(0/0 since ${since}s)`;
+        return ` live:no-delta(0/0 since ${since}s)`;
     }
     return " live:active";
 }

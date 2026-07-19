@@ -62,9 +62,9 @@ function modelRole(modelPreferences: string[] = []): PlannedRole {
 
 function configuredModels(): ConfiguredModel[] {
     return [
-        { key: "ai-genesis-claude/claude-opus-4-8", provider: "ai-genesis-claude", id: "claude-opus-4-8", name: "Claude Opus" },
-        { key: "deepseek/deepseek-v4-flash", provider: "deepseek", id: "deepseek-v4-flash", name: "DeepSeek Flash" },
-        { key: "openai-codex/gpt-5.4-mini", provider: "openai-codex", id: "gpt-5.4-mini", name: "GPT mini" },
+        { key: "provider-a/model-a", provider: "provider-a", id: "model-a", name: "Model A" },
+        { key: "provider-b/model-b", provider: "provider-b", id: "model-b", name: "Model B" },
+        { key: "provider-c/model-c", provider: "provider-c", id: "model-c", name: "Model C" },
     ];
 }
 
@@ -266,6 +266,39 @@ describe("reliability helpers", () => {
         expect(workerLine).not.toContain("checking widget rendering and tests");
     });
 
+    it("shows four workers and prioritizes active workers in the compact TUI", () => {
+        const makeWorker = (roleId: string, status: WorkerRun["status"]): WorkerRun => ({
+            roleId, title: roleId, task: "observe", model: "provider/model", status,
+            output: status === "running" ? "" : "done", outputKind: status === "running" ? "empty" : "substantive",
+            tools: [], startedAt: 1_000, lastSignalAt: 2_000,
+        });
+        const run: TeamRun = {
+            runId: "team_widget_four", task: "observe", playbookId: "generated-blueprint", status: "running",
+            modelHealth: [], workers: [
+                makeWorker("done-1", "succeeded"), makeWorker("done-2", "succeeded"),
+                makeWorker("done-3", "succeeded"), makeWorker("active-4", "running"),
+            ],
+        };
+        const theme: Parameters<typeof teamWidgetLines>[1] = { fg: (_color, text) => text, bold: (text) => text } as Parameters<typeof teamWidgetLines>[1];
+        const lines = teamWidgetLines(run, theme);
+        expect(lines).toHaveLength(5);
+        expect(lines[1]).toContain("active-4");
+        expect(lines.join("\n")).toContain("done-3");
+    });
+
+    it("names hidden active workers in the overflow row", () => {
+        const workers: WorkerRun[] = ["active-1", "active-2", "active-3", "active-4", "active-5"].map((roleId) => ({
+            roleId, title: roleId, task: "observe", model: "provider/model", status: "running",
+            output: "", outputKind: "empty", tools: [], startedAt: 1_000, lastSignalAt: 2_000,
+        }));
+        const run: TeamRun = {
+            runId: "team_widget_overflow", task: "observe", playbookId: "generated-blueprint", status: "running",
+            modelHealth: [], workers,
+        };
+        const theme: Parameters<typeof teamWidgetLines>[1] = { fg: (_color, text) => text, bold: (text) => text } as Parameters<typeof teamWidgetLines>[1];
+        expect(teamWidgetLines(run, theme).at(-1)).toContain("1 active: active-5");
+    });
+
     it("threads role.sop from input through to the PlannedRole (v0.6.0 manual-injection link)", () => {
         const resources = loadTeamResources(projectRoot, defaultsDir);
         const plan = createTeamPlan({
@@ -358,8 +391,9 @@ describe("reliability helpers", () => {
         expect(plan.blocks!.has("c")).toBe(false);
     });
 
-    it("loads continuity-check roles referenced by its playbook", () => {
-        const resources = loadTeamResources(projectRoot, defaultsDir);
+    it("loads continuity-check roles from an internal fixture rather than shipped defaults", () => {
+        const fixtureDefaults = path.join(projectRoot, "test", "fixtures", "defaults");
+        const resources = loadTeamResources(projectRoot, fixtureDefaults);
         const plan = createTeamPlan({ task: "continuity", playbook: "continuity-check" }, resources);
         expect(plan.rounds.map((round) => round.roles.map((role) => role.roleId))).toEqual([
             ["continuity-recorder"],
@@ -368,7 +402,7 @@ describe("reliability helpers", () => {
     });
 
     it("applies strict fallback policy without automatic fallback", () => {
-        const probeSet = selectModelsToProbe([modelRole(["missing/provider-model"])], configuredModels(), defaultsDir, "strict");
+        const probeSet = selectModelsToProbe([modelRole(["missing/provider-model"])], configuredModels(), "strict");
         expect(probeSet.models).toEqual([]);
         const resolved = resolveProbeResults(probeSet, passingHealth(configuredModels()));
         expect(probeSet.rolePlans?.[0]?.failedUserPreferences).toEqual(["missing/provider-model"]);
@@ -381,7 +415,7 @@ describe("reliability helpers", () => {
 
     it("keeps strict user preference failure from falling through to recommendations or legacy routing", () => {
         const role = { ...modelRole(["missing/provider-model"]), roleId: "scout", title: "Scout" };
-        const probeSet = selectModelsToProbe([role], configuredModels(), defaultsDir, "strict");
+        const probeSet = selectModelsToProbe([role], configuredModels(), "strict");
         expect(probeSet.models).toEqual([]);
         const resolved = resolveProbeResults(probeSet, []);
         const plan = { ...basePlan(), rounds: [{ id: "r1", type: "parallel" as const, roles: [role] }] };
@@ -392,154 +426,150 @@ describe("reliability helpers", () => {
         expect(routedRole.routingReason).toContain("policy=strict");
     });
 
-    it("prefers fresh role-matched recommendations before configured order", () => {
-        const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-team-role-recs-"));
-        fs.writeFileSync(path.join(dir, "model-recommendations.json"), JSON.stringify({
-            generatedAt: new Date().toISOString(),
-            version: "test",
-            recommendations: [
-                { rank: 1, key: "openai-codex/gpt-5.4-mini", roles: ["reviewer"], strength: "role matched", speed: "medium", costTier: "standard" },
-            ],
-        }));
-        const models: ConfiguredModel[] = [
-            { key: "deepseek/deepseek-v4-flash", provider: "deepseek", id: "deepseek-v4-flash", name: "DeepSeek Flash" },
-            { key: "openai-codex/gpt-5.4-mini", provider: "openai-codex", id: "gpt-5.4-mini", name: "GPT mini" },
-        ];
-        const role = { ...modelRole(), roleId: "reviewer", title: "Reviewer" };
-        const probeSet = selectModelsToProbe([role], models, dir, "task_first");
-        expect(probeSet.rolePlans![0]!.candidates.map((c) => `${c.source}:${c.key}`)).toEqual([
-            "recommendation:openai-codex/gpt-5.4-mini",
-            "fallback:deepseek/deepseek-v4-flash",
-        ]);
-        const resolved = resolveProbeResults(probeSet, passingHealth(probeSet.models));
-        expect(resolved.rolePlans[0]!.selectedModel).toBe("openai-codex/gpt-5.4-mini");
+    it("strict keeps only captain-approved candidates and never adds automatic backups", () => {
+        const role = modelRole(["provider-b/model-b"]);
+        const probeSet = selectModelsToProbe([role], configuredModels(), "strict");
+        expect(probeSet.rolePlans![0]!.candidates.map((candidate) => candidate.key)).toEqual(["provider-b/model-b"]);
+        expect(probeSet.rolePlans![0]!.candidates.every((candidate) => candidate.source === "user")).toBe(true);
     });
 
-    it("uses default recommendation metadata to route deepseek review work to pro over flash", () => {
-        const models: ConfiguredModel[] = [
-            { key: "deepseek/deepseek-v4-flash", provider: "deepseek", id: "deepseek-v4-flash", name: "DeepSeek Flash" },
-            { key: "deepseek/deepseek-v4-pro", provider: "deepseek", id: "deepseek-v4-pro", name: "DeepSeek Pro" },
-        ];
-        const role = { ...modelRole(), roleId: "reviewer", title: "Reviewer" };
-        const probeSet = selectModelsToProbe([role], models, defaultsDir, "task_first");
-        expect(probeSet.rolePlans![0]!.candidates.map((c) => `${c.source}:${c.key}`)).toEqual([
-            "recommendation:deepseek/deepseek-v4-pro",
-            "fallback:deepseek/deepseek-v4-flash",
-        ]);
-        const resolved = resolveProbeResults(probeSet, passingHealth(probeSet.models));
-        expect(resolved.rolePlans[0]!.selectedModel).toBe("deepseek/deepseek-v4-pro");
+    it("strict skips a sole explicit preference after a recent real-worker failure", () => {
+        const role = modelRole(["provider-b/model-b"]);
+        const probeSet = selectModelsToProbe([role], configuredModels(), "strict");
+        const resolved = resolveProbeResults(probeSet, [{
+            provider: "provider-b", model: "provider-b/model-b", status: "provider_error",
+            evidenceSource: "worker", latencyMs: 1, checkedAt: 1, reason: "recent worker failure",
+        }]);
+        expect(resolved.rolePlans[0]).toMatchObject({
+            selectedModel: undefined,
+            degradedUserPreferences: ["provider-b/model-b"],
+        });
+        expect(resolved.rolePlans[0]!.policyReason).toContain("captain override required");
+        const plan = { ...basePlan(), rounds: [{ id: "r1", type: "parallel" as const, roles: [role] }] };
+        const routed = routeTeamPlan(plan, teamModels(configuredModels()), [], [], resolved);
+        expect(routed.rounds[0]!.roles[0]!.skipReason).toContain("captain override required");
+        expect(routed.rounds[0]!.roles[0]!.modelFallbackKeys).toBeUndefined();
     });
 
-    it("keeps explicit captain model preference ahead of role recommendations", () => {
-        const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-team-explicit-pref-"));
-        fs.writeFileSync(path.join(dir, "model-recommendations.json"), JSON.stringify({
-            generatedAt: new Date().toISOString(),
-            version: "test",
-            recommendations: [
-                { rank: 1, key: "openai-codex/gpt-5.4-mini", roles: ["reviewer"], strength: "role matched", speed: "medium", costTier: "standard" },
-            ],
-        }));
-        const models: ConfiguredModel[] = [
-            { key: "deepseek/deepseek-v4-flash", provider: "deepseek", id: "deepseek-v4-flash", name: "DeepSeek Flash" },
-            { key: "openai-codex/gpt-5.4-mini", provider: "openai-codex", id: "gpt-5.4-mini", name: "GPT mini" },
+    it("prefers the largest runtime context for long-context work", () => {
+        const configured: ConfiguredModel[] = [
+            { key: "provider-a/model-a", provider: "provider-a", id: "model-a", name: "A" },
+            { key: "provider-b/model-b", provider: "provider-b", id: "model-b", name: "B" },
+            { key: "provider-c/model-c", provider: "provider-c", id: "model-c", name: "C" },
         ];
-        const role = { ...modelRole(["deepseek/deepseek-v4-flash"]), roleId: "reviewer", title: "Reviewer" };
-        const probeSet = selectModelsToProbe([role], models, dir, "task_first");
-        expect(probeSet.rolePlans![0]!.candidates.map((c) => `${c.source}:${c.key}`)).toEqual([
-            "user:deepseek/deepseek-v4-flash",
-            "recommendation:openai-codex/gpt-5.4-mini",
-        ]);
-        const resolved = resolveProbeResults(probeSet, passingHealth(probeSet.models));
-        expect(resolved.rolePlans[0]!.selectedModel).toBe("deepseek/deepseek-v4-flash");
+        const runtime: TeamModel[] = [
+            { provider: "provider-a", id: "model-a", name: "A", reasoning: false, contextWindow: 32_000, maxTokens: 8_000, cost: { input: 4, output: 4, cacheRead: 0, cacheWrite: 0 } },
+            { provider: "provider-b", id: "model-b", name: "B", reasoning: true, contextWindow: 256_000, maxTokens: 32_000, cost: { input: 2, output: 2, cacheRead: 0, cacheWrite: 0 } },
+            { provider: "provider-c", id: "model-c", name: "C", reasoning: true, contextWindow: 64_000, maxTokens: 16_000, cost: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 } },
+        ];
+        const role = { ...modelRole(), capabilityNeeds: ["long_context"] as PlannedRole["capabilityNeeds"] };
+        const probeSet = selectModelsToProbe([role], configured, "task_first", false, runtime);
+        expect(probeSet.rolePlans![0]!.candidates[0]).toMatchObject({ source: "metadata", key: "provider-b/model-b" });
     });
 
-    it("falls back to configured order when role recommendations are stale", () => {
-        const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-team-stale-role-recs-"));
-        fs.writeFileSync(path.join(dir, "model-recommendations.json"), JSON.stringify({
-            generatedAt: "2020-01-01T00:00:00Z",
-            version: "test",
-            recommendations: [
-                { rank: 1, key: "openai-codex/gpt-5.4-mini", roles: ["reviewer"], strength: "stale role matched", speed: "medium", costTier: "standard" },
-            ],
-        }));
-        const models: ConfiguredModel[] = [
-            { key: "deepseek/deepseek-v4-flash", provider: "deepseek", id: "deepseek-v4-flash", name: "DeepSeek Flash" },
-            { key: "openai-codex/gpt-5.4-mini", provider: "openai-codex", id: "gpt-5.4-mini", name: "GPT mini" },
+    it("uses runtime cost metadata for cost-sensitive work and cheap_only", () => {
+        const configured: ConfiguredModel[] = [
+            { key: "provider-a/model-a", provider: "provider-a", id: "model-a", name: "A" },
+            { key: "provider-b/model-b", provider: "provider-b", id: "model-b", name: "B" },
+            { key: "provider-c/model-c", provider: "provider-c", id: "model-c", name: "C" },
         ];
-        const role = { ...modelRole(), roleId: "reviewer", title: "Reviewer" };
-        const probeSet = selectModelsToProbe([role], models, dir, "task_first");
-        expect(probeSet.rolePlans![0]!.candidates[0]!.key).toBe("deepseek/deepseek-v4-flash");
-        expect(probeSet.rolePlans![0]!.candidates[0]!.source).toBe("user_default");
-        expect(probeSet.warnings.join("\n")).toContain("推荐数据已过期");
-    });
-
-    it("filters cheap_only recommendation candidates using explicit metadata", () => {
-        const role = { ...modelRole(), roleId: "scout", title: "Scout" };
-        const probeSet = selectModelsToProbe([role], configuredModels(), defaultsDir, "cheap_only");
-        expect(probeSet.models.map((model) => model.key)).toEqual(["deepseek/deepseek-v4-flash"]);
+        const runtime: TeamModel[] = [
+            { provider: "provider-a", id: "model-a", name: "A", reasoning: true, cost: { input: 9, output: 9, cacheRead: 0, cacheWrite: 0 } },
+            { provider: "provider-b", id: "model-b", name: "B", reasoning: true, cost: { input: 3, output: 3, cacheRead: 0, cacheWrite: 0 } },
+            { provider: "provider-c", id: "model-c", name: "C", reasoning: false, cost: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 } },
+        ];
+        const role = { ...modelRole(), capabilityNeeds: ["cost_efficiency"] as PlannedRole["capabilityNeeds"] };
+        const probeSet = selectModelsToProbe([role], configured, "cheap_only", false, runtime);
         expect(probeSet.rolePlans![0]!.candidates.map((candidate) => candidate.key)).toEqual([
-            "deepseek/deepseek-v4-flash", "openai-codex/gpt-5.4-mini",
+            "provider-c/model-c", "provider-b/model-b",
         ]);
+        expect(probeSet.models.map((model) => model.key)).toEqual(["provider-c/model-c"]);
     });
 
-    it("allows efficient role-matched models under cheap_only without model-name guessing", () => {
-        const models: ConfiguredModel[] = [
-            { key: "deepseek/deepseek-v4-flash", provider: "deepseek", id: "deepseek-v4-flash", name: "DeepSeek Flash" },
-            { key: "deepseek/deepseek-v4-pro", provider: "deepseek", id: "deepseek-v4-pro", name: "DeepSeek Pro" },
+    it("prefers reasoning and output capacity for synthesis work", () => {
+        const configured: ConfiguredModel[] = [
+            { key: "provider-a/model-a", provider: "provider-a", id: "model-a", name: "A" },
+            { key: "provider-b/model-b", provider: "provider-b", id: "model-b", name: "B" },
         ];
-        const role = { ...modelRole(), roleId: "reviewer", title: "Reviewer" };
-        const probeSet = selectModelsToProbe([role], models, defaultsDir, "cheap_only");
-        expect(probeSet.rolePlans![0]!.candidates.map((c) => `${c.source}:${c.key}`)).toEqual([
-            "recommendation:deepseek/deepseek-v4-pro",
-            "fallback:deepseek/deepseek-v4-flash",
+        const runtime: TeamModel[] = [
+            { provider: "provider-a", id: "model-a", name: "A", reasoning: false, maxTokens: 8_000, cost: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 } },
+            { provider: "provider-b", id: "model-b", name: "B", reasoning: true, maxTokens: 64_000, cost: { input: 2, output: 2, cacheRead: 0, cacheWrite: 0 } },
+        ];
+        const role = { ...modelRole(), capabilityNeeds: ["synthesis", "critical_review"] as PlannedRole["capabilityNeeds"] };
+        const probeSet = selectModelsToProbe([role], configured, "task_first", false, runtime);
+        expect(probeSet.rolePlans![0]!.candidates[0]!.key).toBe("provider-b/model-b");
+    });
+
+    it("uses optional local capability facts without embedding a catalog", () => {
+        const configured: ConfiguredModel[] = [
+            { key: "provider-a/model-a", provider: "provider-a", id: "model-a", name: "A" },
+            { key: "provider-b/model-b", provider: "provider-b", id: "model-b", name: "B" },
+        ];
+        const profiles = [{
+            family: "project-specialist", models: ["provider-b/model-b"], aliases: [],
+            capabilities: ["fact_checking" as const], displayName: "Project specialist", summary: "",
+            strengths: [], cautions: [], sources: [],
+        }];
+        const role = { ...modelRole(), capabilityNeeds: ["fact_checking"] as PlannedRole["capabilityNeeds"] };
+        const probeSet = selectModelsToProbe([role], configured, "task_first", false, teamModels(configured), profiles);
+        expect(probeSet.rolePlans![0]!.candidates[0]!.key).toBe("provider-b/model-b");
+    });
+
+    it("spreads otherwise tied automatic primaries across providers", () => {
+        const configured: ConfiguredModel[] = [
+            { key: "provider-a/model-a", provider: "provider-a", id: "model-a", name: "A" },
+            { key: "provider-b/model-b", provider: "provider-b", id: "model-b", name: "B" },
+        ];
+        const roles = [
+            { ...modelRole(), roleId: "one", title: "One" },
+            { ...modelRole(), roleId: "two", title: "Two" },
+        ];
+        const probeSet = selectModelsToProbe(roles, configured, "task_first", false, teamModels(configured));
+        expect(probeSet.rolePlans!.map((plan) => plan.candidates[0]!.key)).toEqual([
+            "provider-a/model-a", "provider-b/model-b",
         ]);
-        const resolved = resolveProbeResults(probeSet, passingHealth(probeSet.models));
-        expect(resolved.rolePlans[0]!.selectedModel).toBe("deepseek/deepseek-v4-pro");
     });
 
-    it("limits cheap_only fallback to low-cost fast candidates", () => {
-        const probeSet = selectModelsToProbe([modelRole()], configuredModels(), defaultsDir, "cheap_only");
-        expect(probeSet.models.map((model) => model.key)).toEqual(["deepseek/deepseek-v4-flash"]);
-        expect(probeSet.rolePlans![0]!.candidates).toHaveLength(2);
-        const resolved = resolveProbeResults(probeSet, passingHealth(probeSet.models));
-        expect(resolved.rolePlans[0]!.selectedModel).toBe("deepseek/deepseek-v4-flash");
-        expect(resolved.rolePlans[0]!.fallbackModels).toEqual(["openai-codex/gpt-5.4-mini"]);
+    it("keeps explicit captain preference ahead of stronger metadata scores", () => {
+        const configured: ConfiguredModel[] = [
+            { key: "provider-a/model-a", provider: "provider-a", id: "model-a", name: "A" },
+            { key: "provider-b/model-b", provider: "provider-b", id: "model-b", name: "B" },
+        ];
+        const runtime: TeamModel[] = [
+            { provider: "provider-a", id: "model-a", name: "A", reasoning: false, contextWindow: 8_000, cost: { input: 5, output: 5, cacheRead: 0, cacheWrite: 0 } },
+            { provider: "provider-b", id: "model-b", name: "B", reasoning: true, contextWindow: 256_000, cost: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 } },
+        ];
+        const role = { ...modelRole(["provider-a/model-a"]), capabilityNeeds: ["long_context"] as PlannedRole["capabilityNeeds"] };
+        const probeSet = selectModelsToProbe([role], configured, "task_first", false, runtime);
+        expect(probeSet.rolePlans![0]!.candidates[0]).toMatchObject({ source: "user", key: "provider-a/model-a" });
     });
 
-    it("does not use stale recommendation metadata for cheap_only fallback", () => {
-        const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-team-stale-recs-"));
-        fs.writeFileSync(path.join(dir, "model-recommendations.json"), JSON.stringify({
-            generatedAt: "2020-01-01T00:00:00Z",
-            version: "test",
-            recommendations: [{ rank: 1, key: "deepseek/deepseek-v4-flash", roles: ["unmatched-role"], strength: "cheap test", speed: "fastest", costTier: "budget" }],
-        }));
-        const probeSet = selectModelsToProbe([modelRole()], configuredModels(), dir, "cheap_only");
-        expect(probeSet.models).toEqual([]);
-        expect(probeSet.warnings.join("\n")).toContain("不使用过期推荐元数据");
-    });
-
-    it("keeps cheap_only from broad fallback when all cheap candidates hard-fail", () => {
-        const probeSet = selectModelsToProbe([modelRole()], configuredModels(), defaultsDir, "cheap_only");
-        const health: ModelHealthSnapshot[] = probeSet.rolePlans![0]!.candidates.map((candidate) => ({
-            provider: candidate.key.split("/")[0],
-            model: candidate.key,
-            status: "model_rejected",
-            latencyMs: 1,
-            checkedAt: 1,
+    it("keeps cheap_only from broad fallback when runtime-cost candidates hard-fail", () => {
+        const configured: ConfiguredModel[] = [
+            { key: "provider-a/model-a", provider: "provider-a", id: "model-a", name: "A" },
+            { key: "provider-b/model-b", provider: "provider-b", id: "model-b", name: "B" },
+        ];
+        const runtime: TeamModel[] = [
+            { provider: "provider-a", id: "model-a", name: "A", reasoning: false, cost: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 } },
+            { provider: "provider-b", id: "model-b", name: "B", reasoning: true, cost: { input: 10, output: 10, cacheRead: 0, cacheWrite: 0 } },
+        ];
+        const probeSet = selectModelsToProbe([modelRole()], configured, "cheap_only", false, runtime);
+        const health = probeSet.rolePlans![0]!.candidates.map((candidate) => ({
+            provider: candidate.key.split("/")[0], model: candidate.key, status: "model_rejected" as const,
+            latencyMs: 1, checkedAt: 1,
         }));
         const resolved = resolveProbeResults(probeSet, health);
         expect(resolved.rolePlans[0]!.selectedModel).toBeUndefined();
-        expect(resolved.rolePlans[0]!.fallbackModels).toEqual([]);
-        expect(resolved.rolePlans[0]!.policyReason).toContain("no keyword guessing");
+        expect(resolved.rolePlans[0]!.policyReason).toContain("no model-name guessing");
     });
 
     it("keeps task_first fallbacks available but probes only the primary candidate", () => {
-        const probeSet = selectModelsToProbe([modelRole()], configuredModels(), defaultsDir, "task_first");
-        expect(probeSet.models.map((model) => model.key)).toEqual(["ai-genesis-claude/claude-opus-4-8"]);
+        const probeSet = selectModelsToProbe([modelRole()], configuredModels(), "task_first");
+        expect(probeSet.models.map((model) => model.key)).toEqual(["provider-a/model-a"]);
         expect(probeSet.rolePlans![0]!.candidates).toHaveLength(3);
         const resolved = resolveProbeResults(probeSet, passingHealth(probeSet.models));
         expect(resolved.fallbackPolicy).toBe("task_first");
-        expect(resolved.rolePlans[0]!.selectedModel).toBe("ai-genesis-claude/claude-opus-4-8");
+        expect(resolved.rolePlans[0]!.selectedModel).toBe("provider-a/model-a");
         expect(resolved.rolePlans[0]!.fallbackModels).toHaveLength(2);
     });
 
@@ -547,7 +577,7 @@ describe("reliability helpers", () => {
         expect(shouldDirectModelDispatch({
             task: "two rounds",
             roles: [
-                { id: "evidence", title: "Evidence", modelPreferences: ["deepseek/deepseek-v4-flash"] },
+                { id: "evidence", title: "Evidence", modelPreferences: ["provider-b/model-b"] },
                 { id: "merge", title: "Merge", modelPreferences: ["openai/gpt"], dependsOn: ["evidence"] },
             ],
         }, false)).toBe(true);
@@ -556,26 +586,26 @@ describe("reliability helpers", () => {
     });
 
     it("direct-dispatch probes only captain primaries while retaining lazy fallbacks", () => {
-        const role = modelRole(["deepseek/deepseek-v4-flash"]);
-        const probeSet = selectModelsToProbe([role], configuredModels(), defaultsDir, "task_first", true);
-        expect(probeSet.models.map((m) => m.key)).toEqual(["deepseek/deepseek-v4-flash"]);
+        const role = modelRole(["provider-b/model-b"]);
+        const probeSet = selectModelsToProbe([role], configuredModels(), "task_first", true);
+        expect(probeSet.models.map((m) => m.key)).toEqual(["provider-b/model-b"]);
         expect(probeSet.rolePlans![0]!.candidates[0]!.source).toBe("user");
         expect(probeSet.rolePlans![0]!.candidates.length).toBeGreaterThan(1);
         expect(probeSet.warnings.some((w) => w.includes("direct-dispatch"))).toBe(true);
         const resolved = resolveProbeResults(probeSet, passingHealth(probeSet.models));
-        expect(resolved.rolePlans[0]!.selectedModel).toBe("deepseek/deepseek-v4-flash");
+        expect(resolved.rolePlans[0]!.selectedModel).toBe("provider-b/model-b");
     });
 
     it("non-direct-dispatch keeps lazy backups but probes only the primary model", () => {
-        const role = modelRole(["deepseek/deepseek-v4-flash"]);
-        const broad = selectModelsToProbe([role], configuredModels(), defaultsDir, "task_first", false);
-        expect(broad.models.map((model) => model.key)).toEqual(["deepseek/deepseek-v4-flash"]);
+        const role = modelRole(["provider-b/model-b"]);
+        const broad = selectModelsToProbe([role], configuredModels(), "task_first", false);
+        expect(broad.models.map((model) => model.key)).toEqual(["provider-b/model-b"]);
         expect(broad.rolePlans![0]!.candidates.length).toBeGreaterThan(1);
         expect(broad.warnings.some((w) => w.includes("direct-dispatch"))).toBe(false);
     });
 
     it("treats probe_skipped as transparent but selectable", () => {
-        const probeSet = selectModelsToProbe([modelRole()], configuredModels(), defaultsDir, "task_first");
+        const probeSet = selectModelsToProbe([modelRole()], configuredModels(), "task_first");
         const health: ModelHealthSnapshot[] = probeSet.models.map((model) => ({
             provider: model.provider,
             model: model.key,
@@ -585,8 +615,8 @@ describe("reliability helpers", () => {
             checkedAt: 1,
         }));
         const resolved = resolveProbeResults(probeSet, health);
-        expect(resolved.rolePlans[0]!.selectedModel).toBe("ai-genesis-claude/claude-opus-4-8");
-        expect(resolved.rolePlans[0]!.routingReason).toContain("⚠️");
+        expect(resolved.rolePlans[0]!.selectedModel).toBe("provider-a/model-a");
+        expect(resolved.rolePlans[0]!.routingReason).toContain("warning: not probed");
     });
 
     it("validates thinking level enum boundaries", () => {
@@ -598,15 +628,15 @@ describe("reliability helpers", () => {
     });
 
     it("parses explicit thinking level from model preference suffix", () => {
-        expect(parseModelPreference("deepseek/deepseek-v4-flash:high")).toEqual({
-            model: "deepseek/deepseek-v4-flash",
+        expect(parseModelPreference("provider-b/model-b:high")).toEqual({
+            model: "provider-b/model-b",
             thinkingLevel: "high",
         });
-        expect(parseModelPreference("deepseek/deepseek-v4-flash:not-a-level")).toEqual({
-            model: "deepseek/deepseek-v4-flash:not-a-level",
+        expect(parseModelPreference("provider-b/model-b:not-a-level")).toEqual({
+            model: "provider-b/model-b:not-a-level",
         });
-        expect(parseModelPreference("deepseek/deepseek-v4-flash")).toEqual({ model: "deepseek/deepseek-v4-flash" });
-        expect(parseModelPreference("deepseek/deepseek-v4-flash:")).toEqual({ model: "deepseek/deepseek-v4-flash:" });
+        expect(parseModelPreference("provider-b/model-b")).toEqual({ model: "provider-b/model-b" });
+        expect(parseModelPreference("provider-b/model-b:")).toEqual({ model: "provider-b/model-b:" });
         expect(parseModelPreference("")).toEqual({ model: "" });
         expect(parseModelPreference(":")).toEqual({ model: ":" });
     });
@@ -616,17 +646,17 @@ describe("reliability helpers", () => {
         expect(parseConfiguredModelPreference("ollama/llama3:high", (model) => configured.has(model))).toEqual({
             model: "ollama/llama3:high",
         });
-        expect(parseConfiguredModelPreference("deepseek/deepseek-v4-flash:high", (model) => model === "deepseek/deepseek-v4-flash")).toEqual({
-            model: "deepseek/deepseek-v4-flash",
+        expect(parseConfiguredModelPreference("provider-b/model-b:high", (model) => model === "provider-b/model-b")).toEqual({
+            model: "provider-b/model-b",
             thinkingLevel: "high",
         });
     });
 
     it("routes selected thinking level without semantic auto-judgment", () => {
-        const role = modelRole(["deepseek/deepseek-v4-flash:high"]);
-        const probeSet = selectModelsToProbe([role], configuredModels(), defaultsDir, "task_first");
+        const role = modelRole(["provider-b/model-b:high"]);
+        const probeSet = selectModelsToProbe([role], configuredModels(), "task_first");
         const resolved = resolveProbeResults(probeSet, passingHealth(probeSet.models));
-        expect(resolved.rolePlans[0]!.selectedModel).toBe("deepseek/deepseek-v4-flash");
+        expect(resolved.rolePlans[0]!.selectedModel).toBe("provider-b/model-b");
         expect(resolved.rolePlans[0]!.selectedThinkingLevel).toBe("high");
         expect(resolved.rolePlans[0]!.policyReason).toContain("thinking=high");
         const plan = { ...basePlan(), rounds: [{ id: "r1", type: "parallel" as const, roles: [role] }] };
@@ -634,9 +664,9 @@ describe("reliability helpers", () => {
         expect(routed.rounds[0]!.roles[0]!.thinkingLevel).toBe("high");
     });
 
-    it("applies explicit role thinking to recommendation-selected models", () => {
+    it("applies explicit role thinking to metadata-selected models", () => {
         const role = { ...modelRole(), roleId: "scout", title: "Scout", thinkingLevel: "low" as const };
-        const probeSet = selectModelsToProbe([role], configuredModels(), defaultsDir, "task_first");
+        const probeSet = selectModelsToProbe([role], configuredModels(), "task_first");
         const resolved = resolveProbeResults(probeSet, passingHealth(probeSet.models));
         expect(resolved.rolePlans[0]!.selectedThinkingLevel).toBe("low");
     });
@@ -727,13 +757,13 @@ describe("reliability helpers", () => {
     });
 
     it("selects the first untried fallback model for provider-failure retry", () => {
-        const fallbacks = ["deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro", "xiaomi/mimo-v2-flash"];
+        const fallbacks = ["provider-b/model-b", "provider-b/model-b-pro", "provider-d/model-d"];
         // nothing tried yet → first fallback
-        expect(selectRetryModel([], fallbacks)).toBe("deepseek/deepseek-v4-flash");
+        expect(selectRetryModel([], fallbacks)).toBe("provider-b/model-b");
         // first already attempted → next untried
-        expect(selectRetryModel(["deepseek/deepseek-v4-flash"], fallbacks)).toBe("deepseek/deepseek-v4-pro");
+        expect(selectRetryModel(["provider-b/model-b"], fallbacks)).toBe("provider-b/model-b-pro");
         // skips undefined attempts and respects order
-        expect(selectRetryModel([undefined, "deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro"], fallbacks)).toBe("xiaomi/mimo-v2-flash");
+        expect(selectRetryModel([undefined, "provider-b/model-b", "provider-b/model-b-pro"], fallbacks)).toBe("provider-d/model-d");
         // all exhausted → undefined (loop terminates, no infinite retry)
         expect(selectRetryModel(fallbacks, fallbacks)).toBeUndefined();
         // no fallback keys → undefined
@@ -744,40 +774,40 @@ describe("reliability helpers", () => {
     it("keeps an explicit primary selected after a soft probe timeout", () => {
         // Synthetic liveness probes are advisory; fallback happens only after
         // real work fails.
-        const role = { ...modelRole(["deepseek/deepseek-v4-flash"]), roleId: "scout", title: "Scout" };
-        const probeSet = selectModelsToProbe([role], configuredModels(), defaultsDir, "task_first");
+        const role = { ...modelRole(["provider-b/model-b"]), roleId: "scout", title: "Scout" };
+        const probeSet = selectModelsToProbe([role], configuredModels(), "task_first");
         // backup candidates are built behind the user preference but probed lazily
-        expect(probeSet.models.map((model) => model.key)).toEqual(["deepseek/deepseek-v4-flash"]);
+        expect(probeSet.models.map((model) => model.key)).toEqual(["provider-b/model-b"]);
         expect(probeSet.rolePlans![0]!.candidates.length).toBeGreaterThan(1);
         const health: ModelHealthSnapshot[] = [{
-            provider: "deepseek",
-            model: "deepseek/deepseek-v4-flash",
+            provider: "provider-b",
+            model: "provider-b/model-b",
             status: "timeout",
             latencyMs: 1,
             checkedAt: 1,
         }];
         const resolved = resolveProbeResults(probeSet, health);
-        expect(resolved.rolePlans[0]!.selectedModel).toBe("deepseek/deepseek-v4-flash");
+        expect(resolved.rolePlans[0]!.selectedModel).toBe("provider-b/model-b");
         expect(resolved.rolePlans[0]!.degradedUserPreferences).toEqual([]);
-        expect(resolved.rolePlans[0]!.routingReason).toContain("探测超时");
+        expect(resolved.rolePlans[0]!.routingReason).toContain("probe timeout");
     });
 
     it("demotes a candidate after a fresh real-worker failure", () => {
-        const role = { ...modelRole(["deepseek/deepseek-v4-flash"]), roleId: "scout", title: "Scout" };
-        const probeSet = selectModelsToProbe([role], configuredModels(), defaultsDir, "task_first");
+        const role = { ...modelRole(["provider-b/model-b"]), roleId: "scout", title: "Scout" };
+        const probeSet = selectModelsToProbe([role], configuredModels(), "task_first");
         const health: ModelHealthSnapshot[] = [{
-            provider: "deepseek", model: "deepseek/deepseek-v4-flash", status: "provider_error",
+            provider: "provider-b", model: "provider-b/model-b", status: "provider_error",
             evidenceSource: "worker", reason: "recent worker failure: provider returned 502", latencyMs: 1, checkedAt: 1,
         }];
         const resolved = resolveProbeResults(probeSet, health);
-        expect(resolved.rolePlans[0]!.selectedModel).not.toBe("deepseek/deepseek-v4-flash");
-        expect(resolved.rolePlans[0]!.degradedUserPreferences).toContain("deepseek/deepseek-v4-flash");
-        expect(resolved.rolePlans[0]!.routingReason).toContain("最近真实执行错误");
+        expect(resolved.rolePlans[0]!.selectedModel).not.toBe("provider-b/model-b");
+        expect(resolved.rolePlans[0]!.degradedUserPreferences).toContain("provider-b/model-b");
+        expect(resolved.rolePlans[0]!.routingReason).toContain("recent worker error");
     });
 
     it("selects a degraded model only when no healthy candidate exists and flags it", () => {
-        const role = { ...modelRole(["deepseek/deepseek-v4-flash"]), roleId: "scout", title: "Scout" };
-        const probeSet = selectModelsToProbe([role], configuredModels(), defaultsDir, "task_first");
+        const role = { ...modelRole(["provider-b/model-b"]), roleId: "scout", title: "Scout" };
+        const probeSet = selectModelsToProbe([role], configuredModels(), "task_first");
         const health: ModelHealthSnapshot[] = probeSet.rolePlans![0]!.candidates.map((candidate) => ({
             provider: candidate.key.split("/")[0],
             model: candidate.key,
@@ -790,109 +820,97 @@ describe("reliability helpers", () => {
         // every candidate degraded — selection still happens (no healthy option)
         // but the routing reason surfaces the degradation transparently.
         expect(resolved.rolePlans[0]!.selectedModel).toBeDefined();
-        expect(resolved.rolePlans[0]!.routingReason).toContain("⚠️");
+        expect(resolved.rolePlans[0]!.routingReason).toContain("warning:");
     });
 
     it("keeps probe_skipped in the healthy tier so it is not demoted below probe_passed", () => {
         // A user model that probe-passes must stay selected even when a backup is
         // probe_skipped (unproven, not unavailable) — skipped must not be treated
         // as degraded.
-        const role = { ...modelRole(["deepseek/deepseek-v4-flash"]), roleId: "scout", title: "Scout" };
-        const probeSet = selectModelsToProbe([role], configuredModels(), defaultsDir, "task_first");
+        const role = { ...modelRole(["provider-b/model-b"]), roleId: "scout", title: "Scout" };
+        const probeSet = selectModelsToProbe([role], configuredModels(), "task_first");
         const health: ModelHealthSnapshot[] = probeSet.models.map((model) => ({
             provider: model.provider,
             model: model.key,
-            status: model.key === "deepseek/deepseek-v4-flash" ? "probe_passed" : "probe_skipped",
+            status: model.key === "provider-b/model-b" ? "probe_passed" : "probe_skipped",
             latencyMs: 1,
             checkedAt: 1,
         }));
         const resolved = resolveProbeResults(probeSet, health);
-        expect(resolved.rolePlans[0]!.selectedModel).toBe("deepseek/deepseek-v4-flash");
+        expect(resolved.rolePlans[0]!.selectedModel).toBe("provider-b/model-b");
         expect(resolved.rolePlans[0]!.degradedUserPreferences).toEqual([]);
     });
 
     it("surfaces a recent worker-failed preference for the decision window", () => {
         // Real work failed on the explicit model; substituting a backup requires
         // a visible captain decision.
-        const role = { ...modelRole(["deepseek/deepseek-v4-flash"]), roleId: "scout", title: "Scout" };
-        const probeSet = selectModelsToProbe([role], configuredModels(), defaultsDir, "task_first");
+        const role = { ...modelRole(["provider-b/model-b"]), roleId: "scout", title: "Scout" };
+        const probeSet = selectModelsToProbe([role], configuredModels(), "task_first");
         const health: ModelHealthSnapshot[] = probeSet.models.map((model) => ({
             provider: model.provider,
             model: model.key,
-            status: model.key === "deepseek/deepseek-v4-flash" ? "timeout" : "probe_passed",
+            status: model.key === "provider-b/model-b" ? "timeout" : "probe_passed",
             evidenceSource: "worker" as const,
             latencyMs: 1,
             checkedAt: 1,
         }));
         const resolved = resolveProbeResults(probeSet, health);
-        expect(resolved.rolePlans[0]!.selectedModel).not.toBe("deepseek/deepseek-v4-flash");
-        expect(resolved.rolePlans[0]!.degradedUserPreferences).toContain("deepseek/deepseek-v4-flash");
+        expect(resolved.rolePlans[0]!.selectedModel).not.toBe("provider-b/model-b");
+        expect(resolved.rolePlans[0]!.degradedUserPreferences).toContain("provider-b/model-b");
     });
 
     it("does not mark a soft probe timeout as a dead blueprint model", async () => {
         // Synthetic probe uncertainty must not rewrite the blueprint or route.
-        const role = { ...modelRole(["deepseek/deepseek-v4-flash"]), roleId: "scout", title: "Scout" };
+        const role = { ...modelRole(["provider-b/model-b"]), roleId: "scout", title: "Scout" };
         const plan: TeamPlan = { ...basePlan(), rounds: [{ id: "r1", type: "parallel", roles: [role] }] };
         const cfg = configuredModels();
         const degradedProbe: ProbeModel = async (model) => ({
             provider: model.provider,
             model: `${model.provider}/${model.id}`,
-            status: `${model.provider}/${model.id}` === "deepseek/deepseek-v4-flash" ? "timeout" : "probe_passed",
+            status: `${model.provider}/${model.id}` === "provider-b/model-b" ? "timeout" : "probe_passed",
             latencyMs: 1,
             checkedAt: 1,
         });
-        const result = await probePlan(plan, cfg, teamModels(cfg), defaultsDir, "task_first", false, degradedProbe);
-        expect(result.resolved.rolePlans[0]!.selectedModel).toBe("deepseek/deepseek-v4-flash");
+        const result = await probePlan(plan, cfg, teamModels(cfg), "task_first", false, degradedProbe);
+        expect(result.resolved.rolePlans[0]!.selectedModel).toBe("provider-b/model-b");
         expect(result.resolved.rolePlans[0]!.degradedUserPreferences).toEqual([]);
-        expect(result.deadBlueprintModels).not.toContain("deepseek/deepseek-v4-flash");
+        expect(result.deadBlueprintModels).not.toContain("provider-b/model-b");
     });
 
-    // ── 项3: configured default only after explicit preferences / fresh recommendations ──
+    // ── Runtime metadata selection without bundled recommendations ──
 
-    it("uses the first configured model as a user_default fallback when no recommendation matches", () => {
-        const role = modelRole(); // no modelPreferences
-        const probeSet = selectModelsToProbe([role], configuredModels(), defaultsDir, "task_first");
+    it("uses configured order when no runtime capability fact differentiates candidates", () => {
+        const probeSet = selectModelsToProbe([modelRole()], configuredModels(), "task_first");
         const candidates = probeSet.rolePlans![0]!.candidates;
-        const defaultCandidate = candidates.find((c) => c.source === "user_default");
-        expect(defaultCandidate).toBeDefined();
-        expect(defaultCandidate!.key).toBe(configuredModels()[0]!.key); // ai-genesis-claude/claude-opus-4-8
-        expect(defaultCandidate!.matchReason).toContain("配置默认模型");
+        expect(candidates[0]).toMatchObject({ source: "metadata", key: configuredModels()[0]!.key });
+        expect(candidates[0]!.matchReason).toContain("runtime metadata");
     });
 
-    it("selects configured default when no role recommendation matches", () => {
-        const role = modelRole(); // no modelPreferences and no matching recommendation role id
-        const probeSet = selectModelsToProbe([role], configuredModels(), defaultsDir, "task_first");
+    it("reports metadata routing when automatic selection succeeds", () => {
+        const probeSet = selectModelsToProbe([modelRole()], configuredModels(), "task_first");
         const resolved = resolveProbeResults(probeSet, passingHealth(probeSet.models));
         expect(resolved.rolePlans[0]!.selectedModel).toBe(configuredModels()[0]!.key);
-        expect(resolved.rolePlans[0]!.routingReason).toContain("selected via user_default");
+        expect(resolved.rolePlans[0]!.routingReason).toContain("selected via metadata");
     });
 
-    it("does not add user_default when the role already has explicit modelPreferences", () => {
-        const role = modelRole(["deepseek/deepseek-v4-flash"]);
-        const probeSet = selectModelsToProbe([role], configuredModels(), defaultsDir, "task_first");
+    it("keeps an explicit captain model ahead of automatic metadata candidates", () => {
+        const probeSet = selectModelsToProbe(
+            [modelRole(["provider-b/model-b"])], configuredModels(), "task_first",
+        );
         const candidates = probeSet.rolePlans![0]!.candidates;
-        const defaultCandidate = candidates.find((c) => c.source === "user_default");
-        expect(defaultCandidate).toBeUndefined();
-        // The explicit user preference is still the first candidate
-        expect(candidates[0]!.source).toBe("user");
-        expect(candidates[0]!.key).toBe("deepseek/deepseek-v4-flash");
+        expect(candidates[0]).toMatchObject({ source: "user", key: "provider-b/model-b" });
+        expect(candidates.slice(1).every((candidate) => candidate.source !== "user")).toBe(true);
     });
 
-    it("surfaces a recent worker-failed user_default preference in the decision window", () => {
-        const role = modelRole(); // no modelPreferences → gets user_default
-        const probeSet = selectModelsToProbe([role], configuredModels(), defaultsDir, "task_first");
-        const health: ModelHealthSnapshot[] = probeSet.models.map((model) => ({
-            provider: model.provider,
-            model: model.key,
-            status: model.key === configuredModels()[0]!.key ? "timeout" : "probe_passed",
-            evidenceSource: "worker" as const,
-            latencyMs: 1,
-            checkedAt: 1,
-        }));
-        const resolved = resolveProbeResults(probeSet, health);
-        // If default model degraded and backup exists, the backup should be selected
-        expect(resolved.rolePlans[0]!.selectedModel).not.toBe(configuredModels()[0]!.key);
-        expect(resolved.rolePlans[0]!.degradedUserPreferences).toContain(configuredModels()[0]!.key);
+    it("demotes recent worker-failed metadata without mislabeling it as a captain preference", () => {
+        const probeSet = selectModelsToProbe([modelRole()], configuredModels(), "task_first");
+        const primary = probeSet.models[0]!;
+        const resolved = resolveProbeResults(probeSet, [{
+            provider: primary.provider, model: primary.key, status: "timeout", evidenceSource: "worker",
+            latencyMs: 1, checkedAt: 1,
+        }]);
+        expect(resolved.rolePlans[0]!.selectedModel).not.toBe(primary.key);
+        expect(resolved.rolePlans[0]!.degradedUserPreferences).toEqual([]);
     });
 
     // Thinking intent is role/mode-driven; no model-name defaults.
@@ -906,9 +924,9 @@ describe("reliability helpers", () => {
             thinkingLevel: "low",
         };
         const models = [
-            { key: "deepseek/deepseek-v4-flash", provider: "deepseek", id: "deepseek-v4-flash", name: "DS Flash" },
+            { key: "provider-b/model-b", provider: "provider-b", id: "model-b", name: "Model B" },
         ];
-        const probeSet = selectModelsToProbe([role], models, defaultsDir, "task_first");
+        const probeSet = selectModelsToProbe([role], models, "task_first");
         expect(probeSet.rolePlans![0]!.candidates[0]!.thinkingLevel).toBe("low");
     });
 
@@ -918,7 +936,7 @@ describe("reliability helpers", () => {
         };
         const probeSet = selectModelsToProbe([role], [
             { key: "provider/model", provider: "provider", id: "model", name: "Model" },
-        ], defaultsDir, "task_first");
+        ], "task_first");
         expect(probeSet.rolePlans![0]!.candidates[0]!.thinkingLevel).toBeUndefined();
     });
 
@@ -931,9 +949,9 @@ describe("reliability helpers", () => {
             thinkingLevel: "high",
         };
         const models = [
-            { key: "deepseek/deepseek-v4-flash", provider: "deepseek", id: "deepseek-v4-flash", name: "DS Flash" },
+            { key: "provider-b/model-b", provider: "provider-b", id: "model-b", name: "Model B" },
         ];
-        const probeSet = selectModelsToProbe([role], models, defaultsDir, "task_first");
+        const probeSet = selectModelsToProbe([role], models, "task_first");
         const candidates = probeSet.rolePlans![0]!.candidates;
         // Non-coding role: keep role-level thinking "high"
         expect(candidates[0]!.thinkingLevel).toBe("high");
@@ -941,29 +959,29 @@ describe("reliability helpers", () => {
 
     it("model preference thinking suffix applies when role thinking is unspecified", () => {
         const role: PlannedRole = {
-            ...modelRole(["deepseek/deepseek-v4-flash:high"]),
+            ...modelRole(["provider-b/model-b:high"]),
             roleId: "coder",
             title: "Coder",
             capabilityNeeds: ["coding"],
         };
         const models = [
-            { key: "deepseek/deepseek-v4-flash", provider: "deepseek", id: "deepseek-v4-flash", name: "DS Flash" },
+            { key: "provider-b/model-b", provider: "provider-b", id: "model-b", name: "Model B" },
         ];
-        const probeSet = selectModelsToProbe([role], models, defaultsDir, "task_first");
+        const probeSet = selectModelsToProbe([role], models, "task_first");
         expect(probeSet.rolePlans![0]!.candidates[0]!.thinkingLevel).toBe("high");
     });
 
-    it("explicit role thinking takes priority over coding model recommendations", () => {
+    it("explicit role thinking takes priority over a preference suffix", () => {
         const role: PlannedRole = {
-            ...modelRole(["deepseek/deepseek-v4-flash:low"]),
+            ...modelRole(["provider-b/model-b:low"]),
             roleId: "coder",
             title: "Coder",
             capabilityNeeds: ["coding"],
             thinkingLevel: "high",
         };
         const probeSet = selectModelsToProbe([role], [
-            { key: "deepseek/deepseek-v4-flash", provider: "deepseek", id: "deepseek-v4-flash", name: "DS Flash" },
-        ], defaultsDir, "task_first");
+            { key: "provider-b/model-b", provider: "provider-b", id: "model-b", name: "Model B" },
+        ], "task_first");
         expect(probeSet.rolePlans![0]!.candidates[0]!.thinkingLevel).toBe("high");
     });
 });
@@ -1113,9 +1131,9 @@ describe("handoff digest", () => {
                     status: "succeeded",
                     output: "found it",
                     tools: ["read"],
-                    model: "deepseek/deepseek-v4-flash",
-                    routingReason: "policy=task_first; selected via recommendation; captain remains final judge",
-                    modelFallbackKeys: ["openai-codex/gpt-5.4-mini"],
+                    model: "provider-b/model-b",
+                    routingReason: "policy=task_first; selected via metadata; captain remains final judge",
+                    modelFallbackKeys: ["provider-c/model-c"],
                     outputKind: "substantive",
                     structuredOutput: { result_summary: "Found parser regression in src/parser.ts", evidence_refs: ["src/parser.ts"], confidence: "high", disagreements: [], next_questions: [] },
                     requests: 2,
@@ -1130,7 +1148,7 @@ describe("handoff digest", () => {
                     status: "failed",
                     output: "",
                     tools: ["read"],
-                    model: "openai-codex/gpt-5.4-mini",
+                    model: "provider-c/model-c",
                     outputKind: "empty",
                     errorReason: "worker produced no assistant text",
                     requests: 0,
@@ -1147,8 +1165,8 @@ describe("handoff digest", () => {
         expect(digest).toContain("Status: degraded");
         expect(digest).toContain("total:2 succeeded:1 failed:1 degraded:0 skipped:0");
         expect(digest).toContain("Scout");
-        expect(digest).toContain("route: policy=task_first; selected via recommendation");
-        expect(digest).toContain("fallback: openai-codex/gpt-5.4-mini");
+        expect(digest).toContain("route: policy=task_first; selected via metadata");
+        expect(digest).toContain("fallback: provider-c/model-c");
         expect(digest).toContain("summary: Found parser regression in src/parser.ts");
         expect(digest).toContain("/artifacts/scout.md");
         expect(digest).toContain("worker produced no assistant text");
@@ -1159,8 +1177,8 @@ describe("handoff digest", () => {
 
     it("projects factual previews in team_status data", () => {
         const projection = buildTeamStatusProjection(handoffRun(), []);
-        expect(projection.workers[0]!.routingReason).toContain("selected via recommendation");
-        expect(projection.workers[0]!.modelFallbackKeys).toEqual(["openai-codex/gpt-5.4-mini"]);
+        expect(projection.workers[0]!.routingReason).toContain("selected via metadata");
+        expect(projection.workers[0]!.modelFallbackKeys).toEqual(["provider-c/model-c"]);
         expect(projection.workers[0]!.factualPreview).toBe("Found parser regression in src/parser.ts");
         expect(projection.workers[1]!.factualPreview).toBeUndefined();
     });
@@ -1328,19 +1346,16 @@ describe("watchdog advisory", () => {
         }
     });
 
-    it("ships a default three-law advisory template and uses it only as a fallback", () => {
+    it("ships a model-neutral operational advisory and uses it only as a fallback", () => {
         const defaultsDir = path.resolve("src/defaults");
         // The bundled default template loads as a `default`-level source.
         const fallback = loadDefaultWatchdogSource(defaultsDir);
         expect(fallback).toBeDefined();
         expect(fallback!.level).toBe("default");
-        expect(fallback!.content).toContain("第一法则");
-        // First-law wording must be the corrected "flag then proceed", NOT "refuse".
-        expect(fallback!.content).toContain("标注这个风险后继续执行");
-        // Third law must distinguish teammate findings (advisory) from captain
-        // mailbox instructions (authoritative) so a worker does not treat a
-        // captain directive as ignorable advisory.
-        expect(fallback!.content).toContain("captain 通过 team radio / mailbox 下达的消息是指令");
+        expect(fallback!.content).toContain("observable evidence");
+        expect(fallback!.content).toContain("tool failures");
+        expect(fallback!.content).toContain("Follow direct captain instructions");
+        expect(fallback!.content).not.toContain("Octo");
         // The bundled default can be disabled wholesale via env (off-switch).
         expect(loadDefaultWatchdogSource(defaultsDir, { PI_TEAM_DISABLE_DEFAULT_WATCHDOG: "1" } as unknown as NodeJS.ProcessEnv)).toBeUndefined();
         // A falsy env value keeps the default active.
@@ -1790,30 +1805,30 @@ describe("worker session resume (项2)", () => {
 
 describe("model diversity reduction detection", () => {
     it("flags when >1 worker all route to the same model despite other healthy models", () => {
-        const notice = detectModelConvergence(["a/claude", "a/claude", "a/claude"], 3);
+        const notice = detectModelConvergence(["a/model-a", "a/model-a", "a/model-a"], 3);
         expect(notice).toContain("3 worker(s) use 1 distinct model(s)");
     });
 
     it("flags partial diversity collapse such as four roles using only two models", () => {
-        const notice = detectModelConvergence(["a/claude", "a/claude", "b/qwen", "b/qwen"], 4);
+        const notice = detectModelConvergence(["a/model-a", "a/model-a", "b/model-b", "b/model-b"], 4);
         expect(notice).toContain("4 worker(s) use 2 distinct model(s)");
         expect(notice).toContain("target of 4 healthy/requested model(s)");
     });
 
     it("does NOT flag a single worker", () => {
-        expect(detectModelConvergence(["a/claude"], 3)).toBeUndefined();
+        expect(detectModelConvergence(["a/model-a"], 3)).toBeUndefined();
     });
 
     it("does NOT flag when workers already use distinct models", () => {
-        expect(detectModelConvergence(["a/claude", "b/deepseek"], 3)).toBeUndefined();
+        expect(detectModelConvergence(["a/model-a", "b/provider-b"], 3)).toBeUndefined();
     });
 
     it("does NOT flag when no other healthy or requested model existed", () => {
-        expect(detectModelConvergence(["a/claude", "a/claude"], 1, 1)).toBeUndefined();
+        expect(detectModelConvergence(["a/model-a", "a/model-a"], 1, 1)).toBeUndefined();
     });
 
     it("flags collapse against captain-requested diversity even when probes undercount health", () => {
-        expect(detectModelConvergence(["a/claude", "a/claude", "b/qwen", "b/qwen"], 2, 4))
+        expect(detectModelConvergence(["a/model-a", "a/model-a", "b/model-b", "b/model-b"], 2, 4))
             .toContain("target of 4 healthy/requested model(s)");
     });
 
@@ -1984,8 +1999,8 @@ describe("worker liveness (项9)", () => {
             expect(classifyLiveness(true, 0, 1, 0)).toBe("progressing");
             expect(classifyLiveness(true, 0, 0, 1)).toBe("progressing");
         });
-        it("returns stuck when stale and all deltas are zero", () => {
-            expect(classifyLiveness(true, 0, 0, 0)).toBe("stuck");
+        it("returns no_delta when stale and all deltas are zero", () => {
+            expect(classifyLiveness(true, 0, 0, 0)).toBe("no_delta");
         });
     });
     describe("recordAndDiffLiveness", () => {
@@ -2014,12 +2029,12 @@ describe("worker liveness (项9)", () => {
         });
     });
     describe("formatLivenessTag", () => {
-        it("formats first-poll, active, progressing, and stuck tags", () => {
+        it("formats first-poll, active, progressing, and no-delta tags", () => {
             expect(formatLivenessTag(false, undefined)).toBe(" live:first-poll");
             expect(formatLivenessTag(true, { deltaTokens: 0, deltaRequests: 0, deltaEvents: 0, sinceMs: undefined })).toBe(" live:first-poll");
             expect(formatLivenessTag(false, { deltaTokens: 0, deltaRequests: 0, deltaEvents: 0, sinceMs: 5_000 })).toBe(" live:active");
             expect(formatLivenessTag(true, { deltaTokens: 1234, deltaRequests: 1, deltaEvents: 2, sinceMs: 5_000 })).toBe(" live:progressing(Δtok:1234,Δreq:1)");
-            expect(formatLivenessTag(true, { deltaTokens: 0, deltaRequests: 0, deltaEvents: 0, sinceMs: 45_000 })).toBe(" live:stuck(0/0 since 45s)");
+            expect(formatLivenessTag(true, { deltaTokens: 0, deltaRequests: 0, deltaEvents: 0, sinceMs: 45_000 })).toBe(" live:no-delta(0/0 since 45s)");
         });
     });
 });

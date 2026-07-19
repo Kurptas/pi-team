@@ -1,6 +1,6 @@
 {
   "name": "pi-team",
-  "version": "0.6.9",
+  "version": "0.6.10",
   "description": "An extension for Pi and Oh My Pi that runs tasks across multiple AI models — covering each other's blind spots, the right model for each job.",
   "type": "module",
   "license": "MIT",
@@ -45,8 +45,9 @@
     "test:runner": "vitest --run test/runner-integration.test.ts",
     "typecheck": "tsc --noEmit",
     "check:size": "node scripts/check-file-size.mjs",
+    "check:defaults": "node scripts/check-default-resources.mjs",
     "deploy:global": "node scripts/deploy-global-extension.mjs",
-    "check": "npm run check:size && npm run typecheck && npm run test:team"
+    "check": "npm run check:size && npm run check:defaults && npm run typecheck && npm run test:team"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

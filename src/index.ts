@@ -1,12 +1,13 @@
 import { dirname, join } from "node:path";
-import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { type ExtensionAPI, type ExtensionContext, type ExtensionUIContext, type Theme } from "@earendil-works/pi-coding-agent";
-import type { KeyId } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { promoteBlueprintArtifact } from "./blueprint-store.ts";
 import { loadModelCapabilityProfiles } from "./capabilities.ts";
-import { appendTeamMessage, listTeamRunIds, markTeamObserved, prepareTeamControl, readTeamMailbox, readTeamObservation, readTeamState, requestTeamCancel, requestWorkerCancel, writeTeamState } from "./control.ts";
+import { appendTeamMessage, listTeamRunIds, markTeamObserved, prepareTeamControl, readTeamMailbox, readTeamObservation, readTeamState, requestTeamCancel, requestWorkerCancel, teamControlPaths, writeTeamState } from "./control.ts";
+import { readTeamRunWithControlOverlay } from "./control-overlay.ts";
+import { createCaptainNotificationQueue } from "./captain-notification.ts";
+export { readTeamRunWithControlOverlay } from "./control-overlay.ts";
 import { buildHandoffDigest, readHandoff } from "./handoff.ts";
 import { loadTeamResources } from "./loader.ts";
 import { loadManual } from "./manual-loader.ts";
@@ -24,10 +25,11 @@ import { TeamParams, TeamRunParams, TeamMessageParams, TeamCancelParams, TeamPro
 import { buildTeamStatusProjection } from "./status-projection.ts";
 export { buildTeamStatusProjection } from "./status-projection.ts";
 import {
-    captainAttentionPush, startCaptainAttentionMonitor, type CaptainAttentionMonitorHandle,
+    captainAttentionPush, isCaptainAttentionAlertCurrent, readCaptainAttentionState, startCaptainAttentionMonitor,
+    type CaptainAttentionMonitorHandle,
 } from "./captain-attention.ts";
-import { isTerminalStatus, teamCountSummary, teamWidget, teamWidgetLines, truncatedLines, renderTeamCompact, renderPlainResult } from "./status-render.ts";
-export { teamWidgetLines } from "./status-render.ts";
+import { isTerminalStatus, orderProjectedWorkers, teamCountSummary, teamPlanLabel, teamWidget, teamWidgetLines, truncatedLines, renderTeamCompact, renderPlainResult } from "./status-render.ts";
+export { orderProjectedWorkers, teamWidgetLines } from "./status-render.ts";
 
 const baseDir = dirname(fileURLToPath(import.meta.url));
 const defaultsDir = join(baseDir, "defaults");
@@ -42,30 +44,15 @@ export function backgroundNextAction(hasPendingModelDecision: boolean): "captain
     return hasPendingModelDecision ? "captain_model_decision" : "await_completion_push";
 }
 
-function compactRoutingReason(reason: string | undefined): string | undefined {
-    if (!reason) return undefined;
-    const policy = reason.match(/policy=([^;]+)/)?.[1]?.trim();
-    const via = reason.match(/selected via ([^;|]+)/)?.[1]?.trim();
-    const degraded = reason.includes("⚠️") ? "; degraded-pref" : "";
-    const compact = [policy ? `policy=${policy}` : undefined, via ? `via=${via}` : undefined].filter(Boolean).join("; ");
-    return compact ? `${compact}${degraded}` : reason;
-}
-
 const TEAM_WIDGET_KEY = "pi-team-workers";
 const TEAM_STATUS_KEY = "pi-team-status";
 
 const backgroundRunControllers = new Map<string, AbortController>();
-// Runs the captain explicitly canceled. Their background Promise still settles
-// Canceled runs: captain asked to cancel, suppress completion push.
-// Observed runs: captain polled via team_status, no push unless failed.
+// Session-scoped cancellation/observation gates for background pushes.
 const captainCanceledRuns = new Set<string>();
 const observedRuns = new Set<string>();
 const terminalObservedRuns = new Set<string>();
-// (2026-07-05 B4) Timestamp each background run so we can reap module-level
-// state if its Promise never settles (model API deadlock, hung session,
-// orphaned process). Normal cleanup still happens in .then()/.catch(); this is
-// a bounded-memory backstop only. Entries older than the reap horizon (well past
-// the 1h runaway ceiling) are dropped when the next run starts.
+// Bound module state even if a background Promise never settles.
 const backgroundRunStartedAt = new Map<string, number>();
 const backgroundAttentionMonitors = new Map<string, CaptainAttentionMonitorHandle>();
 function stopBackgroundAttentionMonitor(runId: string): void {
@@ -236,15 +223,25 @@ function logUpdate(
 }
 
 export default function teamExtension(pi: ExtensionAPI) {
+    const attentionNotifications = createCaptainNotificationQueue({
+        isCurrent: async (cwd, runId, alerts) => {
+            const run = await readTeamRunWithControlOverlay(cwd, runId);
+            return run?.status === "running"
+                && !captainCanceledRuns.has(runId)
+                && alerts.every((alert) => isCaptainAttentionAlertCurrent(run, alert));
+        },
+        render: captainAttentionPush,
+        send: (text) => pi.sendUserMessage(text, { deliverAs: "followUp" }),
+        onDropped: async (runId, roleIds) => { await backgroundAttentionMonitors.get(runId)?.release(roleIds); },
+    });
     const startBackgroundAttentionMonitor = (cwd: string, runId: string): void => {
         stopBackgroundAttentionMonitor(runId);
         backgroundAttentionMonitors.set(runId, startCaptainAttentionMonitor({
-            readRun: () => readTeamState(cwd, runId),
+            readRun: () => readTeamRunWithControlOverlay(cwd, runId),
             isTerminal: (run) => isTerminalStatus(run.status),
             isCanceled: () => captainCanceledRuns.has(runId),
-            onAttention: (alerts) => {
-                pi.sendUserMessage(captainAttentionPush(runId, alerts), { deliverAs: "followUp" });
-            },
+            onAttention: (alerts) => attentionNotifications.enqueue(cwd, runId, alerts),
+            stateFile: teamControlPaths(cwd, runId).attentionFile,
         }));
     };
 
@@ -260,49 +257,41 @@ export default function teamExtension(pi: ExtensionAPI) {
         },
     });
 
-    // ── 手动挡：一键切模型 ──
-    // Ctrl+1~4 直连常用模型，替代 Ctrl+P 翻页
-    const QUICK_MODELS: { key: KeyId; provider: string; modelId: string; label: string }[] = [
-        { key: "alt+1", provider: "ai-genesis-claude", modelId: "claude-opus-4-8", label: "Claude Opus 4.8" },
-        { key: "alt+2", provider: "openai-codex", modelId: "gpt-5.5", label: "GPT 5.5" },
-        { key: "alt+3", provider: "deepseek", modelId: "deepseek-v4-pro", label: "DeepSeek V4 Pro" },
-        { key: "alt+4", provider: "deepseek", modelId: "deepseek-v4-flash", label: "DeepSeek Flash" },
-    ];
-    for (const qm of QUICK_MODELS) {
-        pi.registerShortcut(qm.key, {
-            description: `Switch model to ${qm.label}`,
-            handler: async (ctx) => {
-                const model = ctx.modelRegistry?.find(qm.provider, qm.modelId);
-                if (!model) {
-                    ctx.ui.notify(`${qm.label}: model not found`, "warning");
-                    return;
-                }
-                const ok = await pi.setModel(model);
-                ctx.ui.notify(ok ? `→ ${qm.label}` : `${qm.label}: no API key`, ok ? "info" : "warning");
-            },
-        });
-    }
-
     pi.on("session_start", async (_event, ctx) => {
         sessionUi = ctx.hasUI ? ctx.ui : undefined;
         sessionMode = ctx.hasUI ? ctx.mode : undefined;
+        if (typeof ctx.cwd === "string") {
+            for (const runId of await listTeamRunIds(ctx.cwd)) {
+                const run = await readTeamState(ctx.cwd, runId);
+                if (run?.status === "running") startBackgroundAttentionMonitor(ctx.cwd, runId);
+            }
+        }
+    });
+
+    pi.on("agent_start", async () => { attentionNotifications.agentStarted(); });
+    pi.on("agent_end", async () => {
+        attentionNotifications.agentEnded();
+        setTimeout(() => { void attentionNotifications.flushIfIdle().catch(() => undefined); }, 100);
     });
 
     pi.on("session_shutdown", async () => {
         clearTeamUi();
+        for (const notification of attentionNotifications.drain()) {
+            await backgroundAttentionMonitors.get(notification.runId)?.release(notification.roleIds);
+        }
+        for (const monitor of backgroundAttentionMonitors.values()) monitor.stop();
+        backgroundAttentionMonitors.clear();
         sessionUi = undefined;
         sessionMode = undefined;
     });
 
     pi.on("before_agent_start", async (event) => {
-        // Load the captain manual from the manuals/ tree (frontmatter stripped by
-        // loadManual). Falls back to the legacy flat file if the new path is absent.
         const loaded = loadManual(join(defaultsDir, "manuals", "captain", "01-captain-manual.md"));
-        const manual = loaded ? loaded.body.trim() : readFileSync(join(defaultsDir, "captain-manual.md"), "utf-8");
+        const manual = loaded?.body.trim() ?? "";
         return {
             systemPrompt: `${event.systemPrompt}
 
-Team captain contract: when you use the \`team\` tool, you are the captain for the whole task. The tool is a communication, dispatch, evidence, and observation channel. You own the plan, role design, model preference choices, progress inspection, evidence check, conflict handling, follow-up dispatch decision, and final answer. Use a Plan-Do-Check-Act loop: plan the team, run it, inspect model health and worker outputs, then decide whether to synthesize, ask another pass, change roles, use other tools, or report limitations. Treat model capability facts (strengths, cautions, recommended roles, and context notes) as inputs for your judgment. Treat model health probe results as current channel availability. Make the final judgment yourself and explain material gaps or failed workers.\n\n${manual}`,
+Team captain contract: when you use the \`team\` tool, you are the captain for the whole task. The tool is a communication, dispatch, evidence, and observation channel. You own the plan, role design, model preference choices, progress inspection, evidence check, conflict handling, follow-up dispatch decision, and final answer. Use a Plan-Do-Check-Act loop: plan the team, run it, inspect model health and worker outputs, then decide whether to synthesize, ask another pass, change roles, use other tools, or report limitations. Treat model capability facts (capability tags, strengths, cautions, and context notes) as inputs for your judgment. Treat model health probe results as current channel availability. Make the final judgment yourself and explain material gaps or failed workers.\n\n${manual}`,
         };
     });
 
@@ -325,7 +314,7 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
             const input = params as TeamInput;
             const teamUpdate = teamUpdateSink(onUpdate, ctx);
             const resources = loadTeamResources(ctx.cwd, defaultsDir);
-            const capabilityProfiles = loadModelCapabilityProfiles(defaultsDir);
+            const capabilityProfiles = loadModelCapabilityProfiles(ctx.cwd);
             const inheritedTools = inheritedTeamTools(pi);
             const semanticPlan =
                 !input.playbook && !input.roles
@@ -383,7 +372,10 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
                 ? ((model: TeamModel) => Promise.resolve({ model: `${model.provider}/${model.id}`, provider: model.provider, status: "probe_skipped" as const, latencyMs: 0, reason: "probeModels=false", checkedAt: Date.now() }))
                 : process.env.PI_TEAM_PROBE_USE_CLI === "1" ? createCliProbe() : createInProcessProbe(ctx.modelRegistry, ctx.cwd);
 
-            let result = await probePlan(plan, configuredModels, availableModels, defaultsDir, fallbackPolicy, directDispatch, probe, signal, input.probeModels !== false);
+            let result = await probePlan(
+                plan, configuredModels, availableModels, fallbackPolicy, directDispatch,
+                probe, signal, input.probeModels !== false, capabilityProfiles,
+            );
             let deadBlueprint = result.deadBlueprintModels;
             let currentPlan = plan;
 
@@ -394,7 +386,10 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
                 const revised = await createSemanticPlan(ctx.cwd, input, inheritedTools, capabilityProfiles, signal, deadBlueprint);
                 if (revised) {
                     currentPlan = createTeamPlan({ ...input, roles: revised.roles }, resources, revised);
-                    result = await probePlan(currentPlan, configuredModels, availableModels, defaultsDir, fallbackPolicy, directDispatch, probe, signal, input.probeModels !== false);
+                    result = await probePlan(
+                        currentPlan, configuredModels, availableModels, fallbackPolicy, directDispatch,
+                        probe, signal, input.probeModels !== false, capabilityProfiles,
+                    );
                 }
             }
             const { probeSet, modelHealth: health, resolved } = result;
@@ -405,7 +400,6 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
                 message: `selected ${probeSet.models.length}/${availableModels.length} relevant model(s) to probe across ${currentPlan.rounds.flatMap((r) => r.roles).length} role(s); fallbackPolicy=${fallbackPolicy}` +
                     (directDispatch ? "; direct-dispatch (captain fully specified — probing only chosen models as liveness check)" : "") +
                     (semanticPlan && deadBlueprint.length > 0 ? `; blueprint revision: ${deadBlueprint.length} unavailable model(s) → replanned` : "") +
-                    (probeSet.recommendationStale ? `; recommendation data stale (${Math.round(probeSet.recommendationAgeDays)}d)` : "") +
                     (probeSet.warnings.length > 0 ? `; ${probeSet.warnings.join(" | ")}` : ""),
                 status: run.status,
             });
@@ -618,7 +612,7 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
                                 pendingModelDecision
                                     ? "Next action: send a valid role-specific model decision or allow the bounded decision window to expire."
                                     : "Next action: await_completion_push. End this turn; do not poll just to measure time.",
-                                "The runtime will send a captain-attention follow-up after sustained recorded silence; it never auto-cancels workers.",
+                                "The runtime sends one captain-attention follow-up per communication/request episode after two minutes. If the captain inspects it, only surfaced workers get one new observation window; the runtime never auto-cancels workers.",
                             ].join("\n"),
                         },
                     ],
@@ -689,7 +683,7 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
                     isError: true,
                 };
             }
-            let run = await readTeamState(ctx.cwd, runId);
+            let run = await readTeamRunWithControlOverlay(ctx.cwd, runId);
             if (!run) {
                 return {
                     content: [{ type: "text", text: `Team run ${runId} was not found.` }],
@@ -702,7 +696,17 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
             observedRuns.add(runId);
             const observedAt = Date.now();
             const terminal = isTerminalStatus(run.status);
+            const attentionStateAtObservation = await readCaptainAttentionState(teamControlPaths(ctx.cwd, run.runId).attentionFile);
             await markTeamObserved(ctx.cwd, runId, { terminal, now: observedAt });
+            attentionNotifications.invalidate(runId);
+            if (!terminal) {
+                if (!backgroundAttentionMonitors.has(runId)) startBackgroundAttentionMonitor(ctx.cwd, runId);
+                await backgroundAttentionMonitors.get(runId)?.rearm(
+                    run.workers.filter((worker) => worker.status === "running").map((worker) => worker.roleId),
+                    observedAt,
+                );
+                attentionNotifications.invalidate(runId);
+            }
             // Avoid rewriting a running state snapshot just to record observation:
             // worker subprocesses may be writing fresh events concurrently. The
             // sidecar observation file is enough while the run is active.
@@ -719,81 +723,64 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
                 clearTeamUi(run.runId, ui);
                 clearLiveness(run.runId);
             }
+            if (attentionStateAtObservation) run = { ...run, attentionState: attentionStateAtObservation };
             const mailboxMessages = run.mailboxFile ? await readTeamMailbox(ctx.cwd, run.runId) : [];
-            const projection = buildTeamStatusProjection(run, mailboxMessages);
-            const liveness = recordAndDiffLiveness(run.runId, projection.workers.map((w) => ({ roleId: w.roleId, tokens: w.tokens, requests: w.requests, eventCount: w.eventCount }))); // 项9: diff usage vs prior poll -> "progressing" vs "frozen"
+            const projection = buildTeamStatusProjection(run, mailboxMessages, observedAt, attentionStateAtObservation);
+            const liveness = recordAndDiffLiveness(run.runId, projection.workers.map((w) => ({ roleId: w.roleId, tokens: w.tokens, requests: w.requests, eventCount: w.eventCount }))); // Compare usage with the prior observation.
             const health = projection.modelHealth
                 .map((snapshot) => `${snapshot.model}:${snapshot.status}/${snapshot.evidenceSource ?? "unknown"}`).join(", ");
-            const workers = projection.workers
-                .map((worker) => {
-                    const model = worker.model ?? "(unassigned)";
-                    const thinking = worker.thinkingLevel ? ` thinking:${worker.thinkingLevel}` : "";
-                    const elapsed =
-                        worker.elapsedSeconds === undefined ? "elapsed:n/a" : `elapsed:${worker.elapsedSeconds}s`;
-                    const signal =
-                        worker.status !== "running"
-                            ? "ended"
-                            : worker.signalAgeSeconds === undefined
-                              ? "signal:n/a"
-                              : `signal:${worker.signalAgeSeconds}s`;
-                    const stale = worker.stale ? " stale" : "";
-                    const usage = ` req:${worker.requests} tok:${worker.tokens}${worker.costUsd > 0 ? ` cost:$${worker.costUsd.toFixed(4)}` : ""}`;
-                    const toolCounts = ` toolCalls:${worker.toolCallCount}${worker.toolErrorCount > 0 ? ` toolErrors:${worker.toolErrorCount}` : ""}`;
-                    const output = worker.outputKind ? ` output:${worker.outputKind}` : "";
-                    const route = worker.routingReason ? ` route:${compactRoutingReason(worker.routingReason)}` : "";
-                    const fallback = worker.modelFallbackKeys && worker.modelFallbackKeys.length > 0 ? ` fallback:[${worker.modelFallbackKeys.slice(0, 3).join(",")}]` : "";
-                    const summary = worker.status !== "running" && worker.factualPreview ? ` summary:${worker.factualPreview}` : "";
-                    const report = worker.lastReportPreview ? ` report:${worker.lastReportPreview}` : "";
-                    const captain = worker.lastCaptainMessagePreview
-                        ? ` captain:${worker.lastCaptainMessagePreview}`
-                        : "";
-                    const cancelStatus =
-                        worker.cancelRequestedAt === undefined
-                            ? ""
-                            : worker.cancelObservedAt === undefined
-                              ? " cancel:requested"
-                              : " cancel:observed";
-                    const exitInfo =
-                        worker.status === "succeeded" || worker.status === "failed" || worker.status === "degraded"
-                            ? ` exit:${worker.exitCode ?? "?"}${worker.exitSignal ? `/${worker.exitSignal}` : ""}`
-                            : "";
-                    const toolSummary =
-                        worker.tools && worker.tools.length > 0 ? ` tools:[${worker.tools.slice(0, 3).join(",")}${worker.tools.length > 3 ? "..." : ""}]` : "";
-                    const activeToolSummary = worker.activeTools ? ` activeTools:[${worker.activeTools.slice(0, 3).join(",")}${worker.activeTools.length > 3 ? "..." : ""}]` : "";
-                    const isolation = worker.toolIsolationViolation ? ` isolation:${worker.toolIsolationViolation}` : "";
-                    const lane = worker.laneId ? ` lane:${worker.laneId.slice(0, 12)}…${worker.laneId.slice(-4)}` : "";
-                    const roleTag = worker.roleId ? ` [${worker.roleId}]` : "";
-                    const live = worker.status === "running" ? ` ${formatLivenessTag(worker.stale, liveness.get(worker.roleId))}` : "";
-                    return `${worker.status}${stale}${roleTag} ${worker.title} ${model}${thinking} ${elapsed} ${signal} ${worker.activity} events:${worker.eventCount}${toolCounts}${usage}${output}${route}${fallback}${summary}${report}${captain}${cancelStatus}${exitInfo}${toolSummary}${activeToolSummary}${isolation}${lane}${live}`;
-                })
-                .join("\n");
+            const workers = orderProjectedWorkers(projection.workers).map((worker) => {
+                const model = worker.model ?? "(unassigned)";
+                const thinking = worker.thinkingLevel ? ` thinking:${worker.thinkingLevel}` : "";
+                const elapsed = worker.elapsedSeconds === undefined ? "elapsed:n/a" : `elapsed:${worker.elapsedSeconds}s`;
+                const communication = worker.status === "running"
+                    ? `comm:${worker.communicationAgeSeconds === undefined ? "n/a" : `${worker.communicationAgeSeconds}s`}`
+                    : "ended";
+                const queued = worker.pendingDeliveryRef
+                    ? ` QUEUED:${worker.pendingDeliveryRef}${worker.pendingDeliveryAgeSeconds === undefined ? "" : `/${worker.pendingDeliveryAgeSeconds}s`}` : "";
+                const ack = worker.pendingAckRef
+                    ? ` AWAITING_ACK:${worker.pendingAckRef}${worker.pendingAckAgeSeconds === undefined ? "" : `/${worker.pendingAckAgeSeconds}s`}` : "";
+                const preview = worker.status === "running" ? worker.lastReportPreview : worker.factualPreview;
+                const previewText = preview ? ` preview:${preview}` : "";
+                const output = worker.outputKind && worker.outputKind !== "substantive" ? ` output:${worker.outputKind}` : "";
+                const error = worker.errorReason && (worker.status === "failed" || worker.status === "degraded")
+                    ? ` error:${worker.errorReason}` : "";
+                const anomalies = `${worker.timedOut ? " timeout" : ""}${worker.streamParseErrorCount > 0 ? ` parseErrors:${worker.streamParseErrorCount}` : ""}${worker.toolErrorCount > 0 ? ` toolErrors:${worker.toolErrorCount}` : ""}${worker.toolIsolationViolation ? ` isolation:${worker.toolIsolationViolation}` : ""}${worker.cancelRequestedAt === undefined ? "" : worker.cancelObservedAt === undefined ? ` cancel:requested${worker.cancelPendingAgeSeconds === undefined ? "" : `/${worker.cancelPendingAgeSeconds}s`}` : " cancel:observed"}`;
+                const cancelPending = worker.cancelRequestedAt !== undefined && worker.cancelObservedAt === undefined;
+                const needsControlEvidence = worker.status === "running" && (worker.stale || worker.attentionDebt || cancelPending);
+                const controlEvidence = needsControlEvidence
+                    ? ` ${worker.activity} req:${worker.requests} tok:${worker.tokens}${worker.costUsd > 0 ? ` cost:$${worker.costUsd.toFixed(4)}` : ""}` : "";
+                const live = needsControlEvidence ? formatLivenessTag(worker.stale, liveness.get(worker.roleId)) : "";
+                return `${worker.status}${worker.stale ? " stale" : ""} [${worker.roleId}] ${worker.title} ${model}${thinking} ${elapsed} ${communication}${queued}${ack}${output}${anomalies}${controlEvidence}${previewText}${error}${live}`;
+            }).join("\n");
+            const ackSummary = projection.ackGroups.map((group) => {
+                const delivered = group.deliveredRoleIds.length > 0 ? ` deliveredBy:[${group.deliveredRoleIds.join(",")}]` : "";
+                const acked = group.ackedRoleIds.length > 0 ? ` ackedBy:[${group.ackedRoleIds.join(",")}]` : "";
+                const delivery = group.pendingDeliveryRoleIds.length > 0 ? ` queued:[${group.pendingDeliveryRoleIds.join(",")}]` : "";
+                const ack = group.pendingAckRoleIds.length > 0 ? ` awaitingAck:[${group.pendingAckRoleIds.join(",")}]` : "";
+                const terminal = group.terminalWithoutAckRoleIds.length > 0 ? ` endedNoAck:[${group.terminalWithoutAckRoleIds.join(",")}]` : "";
+                return `request ${group.requestRef}: ack:${group.acked}/${group.total} delivered:${group.delivered}/${group.total}${delivered}${acked}${delivery}${ack}${terminal}`;
+            }).join("\n");
             return {
                 content: [
                     {
                         type: "text",
                         text: [
                             `Team run ${run.runId}: ${run.status}`,
-                            `playbook: ${run.playbookId}`,
-                            `fallback policy: ${run.fallbackPolicy ?? "task_first"}`,
-                            `workers: total:${projection.counts.total} active:${projection.counts.active} succeeded:${projection.counts.succeeded} failed:${projection.counts.failed} degraded:${projection.counts.degraded} skipped:${projection.counts.skipped} stale:${projection.counts.stale}`,
-                            `signals: timedOut:${projection.counts.timedOut} parseErrors:${projection.counts.parseErrors} toolViolations:${projection.counts.toolViolations} toolCalls:${projection.counts.toolCalls} toolErrors:${projection.counts.toolErrors}`,
-                            `usage: req:${projection.counts.requests} tok:${projection.counts.tokens}${projection.counts.costUsd > 0 ? ` cost:$${projection.counts.costUsd.toFixed(4)}` : " cost:(none recorded)"}`,
-                            `mailbox: ${projection.mailbox.file ?? "(none)"} messages:${projection.mailbox.messages}`,
-                            `mailbox text: ${run.mailboxTextFile ?? "(none)"}`,
-                            projection.mailbox.lastMessagePreview
-                                ? `mailbox last: ${projection.mailbox.lastMessagePreview}`
-                                : undefined,
-                            `cancel: ${projection.cancelFile ?? "(none)"}`,
-                            `events: ${(run.events ?? []).length}`,
-                            `state write: ${projection.stateWriteError ?? "ok"}`,
-                            `controls: ${projection.controls.join(", ") || "(none)"}`,
-                            `evidence warnings: ${projection.evidenceWarnings.length > 0 ? projection.evidenceWarnings.join(" | ") : "(none)"}`,
-                            run.delegationLanes && run.delegationLanes.length > 0
-                                ? `lanes: total:${run.delegationLanes.length} active:${run.delegationLanes.filter((l) => l.status === "active").length} succeeded:${run.delegationLanes.filter((l) => l.status === "succeeded").length} failed:${run.delegationLanes.filter((l) => l.status === "failed").length} skipped:${run.delegationLanes.filter((l) => l.status === "skipped").length} cancelled:${run.delegationLanes.filter((l) => l.status === "cancelled").length} ackComplete:${run.delegationLanes.filter((l) => l.ackState === "complete").length}`
-                                : undefined,
-                            `model health: ${health || "(none recorded)"}`,
+                            `plan: ${teamPlanLabel(run.playbookId)}${run.playbookId === "generated-blueprint" ? " (task-specific roles)" : ""}`,
+                            run.fallbackPolicy && run.fallbackPolicy !== "task_first" ? `fallback policy: ${run.fallbackPolicy}` : undefined,
+                            `workers: total:${projection.counts.total} active:${projection.counts.active} succeeded:${projection.counts.succeeded} failed:${projection.counts.failed} degraded:${projection.counts.degraded} skipped:${projection.counts.skipped} stale:${projection.counts.stale} attention:${projection.counts.attentionDebt}`,
+                            projection.counts.timedOut + projection.counts.parseErrors + projection.counts.toolViolations + projection.counts.toolErrors > 0
+                                ? `signals: timedOut:${projection.counts.timedOut} parseErrors:${projection.counts.parseErrors} toolViolations:${projection.counts.toolViolations} toolErrors:${projection.counts.toolErrors}` : undefined,
+                            projection.mailbox.messages > 0 ? `mailbox: ${projection.mailbox.messages} message(s)` : undefined,
+                            projection.mailbox.lastMessagePreview ? `mailbox last: ${projection.mailbox.lastMessagePreview}` : undefined,
+                            projection.stateWriteError ? `state write error: ${projection.stateWriteError}` : undefined,
+                            projection.controls.length > 0 ? `controls: ${projection.controls.join(", ")}` : undefined,
+                            projection.evidenceWarnings.length > 0 ? `evidence warnings: ${projection.evidenceWarnings.join(" | ")}` : undefined,
+                            ackSummary || undefined,
+                            health ? `model health: ${health}` : undefined,
                             projection.counts.stale > 0
-                                ? `note: stale is not stuck — long composition can be silent. The runtime sends one attention follow-up only after sustained no-growth checks; do not repeatedly poll to measure time. Only cancel with corroborating frozen/runaway evidence.`
+                                ? `note: stale is not stuck. Attention is one-shot until the captain observes/intervenes; then only surfaced workers get one new two-minute window. Token or tool activity is corroborating evidence, not communication. Captain decides whether to wait, steer, or cancel.`
                                 : undefined,
                             workers || "(no workers)",
                         ]
@@ -816,8 +803,8 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
         name: "team_message",
         label: "Team Message",
         description:
-            "Send a captain message to an active team run mailbox. Workers can observe it through their radio protocol and mailbox path.",
-        promptSnippet: "Send a captain steering message to workers in an active team run.",
+            "Send a captain message to one active worker or broadcast to the run. Addressed workers acknowledge it through the radio protocol.",
+        promptSnippet: "Send a targeted or broadcast captain steering message to an active team run.",
         promptGuidelines: [
             "Use team_message only to add material constraints, corrections, or priorities for workers in an active team run.",
         ],
@@ -854,18 +841,48 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
                     isError: true,
                 };
             }
-            const paths = await appendTeamMessage(ctx.cwd, runId, params.message);
+            let targetRoleId: string | undefined;
+            if (params.roleId?.trim()) {
+                const resolution = resolveWorkerByKey(run.workers, params.roleId.trim());
+                if (resolution.kind !== "found") {
+                    const detail = resolution.kind === "ambiguous"
+                        ? ` is ambiguous; use an exact roleId: ${resolution.candidates.map((item) => item.roleId).join(", ")}`
+                        : " was not found";
+                    return {
+                        content: [{ type: "text", text: `Worker ${params.roleId}${detail} in run ${runId}.` }],
+                        details: { runId, roleId: params.roleId },
+                        isError: true,
+                    };
+                }
+                if (resolution.worker.status !== "running") {
+                    return {
+                        content: [{ type: "text", text: `Worker ${resolution.worker.roleId} is already ${resolution.worker.status}.` }],
+                        details: { runId, roleId: resolution.worker.roleId, status: resolution.worker.status },
+                        isError: true,
+                    };
+                }
+                targetRoleId = resolution.worker.roleId;
+            }
+            const affectedRoleIds = targetRoleId
+                ? [targetRoleId]
+                : run.workers.filter((worker) => worker.status === "running").map((worker) => worker.roleId);
+            const paths = await appendTeamMessage(ctx.cwd, runId, params.message, { targetRoleId });
+            const queuedAttentionRoles = attentionNotifications.invalidate(runId);
+            if (!backgroundAttentionMonitors.has(runId)) startBackgroundAttentionMonitor(ctx.cwd, runId);
+            await backgroundAttentionMonitors.get(runId)?.rearm([...new Set([...affectedRoleIds, ...queuedAttentionRoles])]);
+            attentionNotifications.invalidate(runId);
+            const target = targetRoleId ? ` worker ${targetRoleId}` : " all active workers";
             return {
                 content: [
                     {
                         type: "text",
                         text:
-                            `Captain message written for ${runId}: ${paths.mailboxFile}. ` +
-                            `This is cooperative steering, not an interrupt: a worker only sees it at its next decision point (after its current tool call finishes), so obedience is not immediate and is not guaranteed. ` +
+                            `Captain request ${paths.requestId} written for${target} in ${runId}: ${paths.mailboxFile}. ` +
+                            `Addressed workers must acknowledge this request in a RADIO report after reading it. This is cooperative steering, not an interrupt: a worker only sees it at its next decision point (after its current tool call finishes), so obedience is not immediate and is not guaranteed. ` +
                             `For a hard stop of a specific worker, use team_cancel_worker.`,
                     },
                 ],
-                details: { runId, mailboxFile: paths.mailboxFile, message: params.message },
+                details: { runId, requestId: paths.requestId, targetRoleId, mailboxFile: paths.mailboxFile, message: params.message },
             };
         },
     });
@@ -983,6 +1000,9 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
             const guard = guardCancelLastWorker(run.workers, resolvedRoleId, runId, params.confirm === true); // P1 rigid-loop guard
             if (!guard.ok) return { content: [{ type: "text", text: guard.message }], details: { runId, roleId: resolvedRoleId, runningCount: guard.runningCount, needsConfirm: true }, isError: true };
             const cancelFile = await requestWorkerCancel(ctx.cwd, runId, resolvedRoleId, reason);
+            const queuedAttentionRoles = attentionNotifications.invalidate(runId);
+            await backgroundAttentionMonitors.get(runId)?.rearm(queuedAttentionRoles);
+            attentionNotifications.invalidate(runId);
             const matchNote = resolvedRoleId !== roleId ? ` (matched your input "${roleId}" to roleId "${resolvedRoleId}")` : "";
             // Factual signal (not a gate, not a second confirm): if no worker has
             // completed AND no other worker is still running, this cancel leaves
@@ -1075,6 +1095,7 @@ Team captain contract: when you use the \`team\` tool, you are the captain for t
             // already covered by terminalStatuses above. No separate canceled check needed.
             const reason = params.reason?.trim() || "captain requested cancellation";
             captainCanceledRuns.add(runId);
+            attentionNotifications.invalidate(runId);
             stopBackgroundAttentionMonitor(runId);
             let paths: Awaited<ReturnType<typeof requestTeamCancel>>;
             try {

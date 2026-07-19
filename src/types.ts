@@ -114,30 +114,32 @@ export interface TeamModel {
     id: string;
     name: string;
     reasoning: boolean;
+    input?: Model<Api>["input"];
     cost: Model<Api>["cost"];
+    contextWindow?: number;
+    maxTokens?: number;
 }
 
-export type ModelCapabilityDimension =
-    | "coding"
-    | "research"
-    | "fact_checking"
-    | "synthesis"
-    | "chinese_writing"
-    | "tool_use"
-    | "long_context"
-    | "speed"
-    | "cost_efficiency"
-    | "critical_review";
+export const MODEL_CAPABILITY_DIMENSIONS = [
+    "coding", "research", "fact_checking", "synthesis", "chinese_writing",
+    "tool_use", "long_context", "speed", "cost_efficiency", "critical_review",
+] as const;
+
+export type ModelCapabilityDimension = (typeof MODEL_CAPABILITY_DIMENSIONS)[number];
+
+export function isModelCapabilityDimension(value: string): value is ModelCapabilityDimension {
+    return (MODEL_CAPABILITY_DIMENSIONS as readonly string[]).includes(value);
+}
 
 export interface ModelCapabilityProfile {
     family: string;
     models: string[];
     aliases: string[];
+    capabilities: ModelCapabilityDimension[];
     displayName: string;
     summary: string;
     strengths: string[];
     cautions: string[];
-    recommendedRoles: string[];
     sources: string[];
 }
 
@@ -168,6 +170,7 @@ export interface RoleSpec {
     title: string;
     description: string;
     tools: string[];
+    capabilityNeeds: ModelCapabilityDimension[];
     modelPreferences: string[];
     thinkingLevel?: ThinkingLevel;
     outputSchema: string;
@@ -261,6 +264,14 @@ export interface ModelHealthSnapshot {
     checkedAt: number;
 }
 
+export interface CaptainRequestState {
+    requestRef: string;
+    queuedAt: number;
+    deliveredAt?: number;
+    ackedAt?: number;
+    preview?: string;
+}
+
 export interface WorkerRun {
     roleId: string;
     title: string;
@@ -282,7 +293,13 @@ export interface WorkerRun {
     lastReportAt?: number;
     lastReportPreview?: string;
     lastCaptainMessageAt?: number;
+    lastCaptainMessageRef?: string;
     lastCaptainMessagePreview?: string;
+    lastCaptainDeliveredAt?: number;
+    lastCaptainDeliveredRef?: string;
+    lastCaptainAckAt?: number;
+    lastCaptainAckRef?: string;
+    captainRequests?: Record<string, CaptainRequestState>;
     lastOutputPreview?: string;
     outputKind?: WorkerOutputKind;
     /**
@@ -321,12 +338,29 @@ export interface WorkerRun {
     delegationToken?: string;
 }
 
+export interface TeamAttentionRoleState {
+    communicationAt?: number;
+    silenceAlerted: boolean;
+    pendingRequestRef?: string;
+    pendingRequestStage?: "queued" | "delivered";
+    pendingAckAlerted: boolean;
+    pendingCancelAt?: number;
+    cancelAlerted: boolean;
+    rearmAt?: number;
+}
+
+export interface TeamAttentionState {
+    roles: Record<string, TeamAttentionRoleState>;
+}
+
 export interface TeamRun {
     runId: string;
     task: string;
     playbookId: string;
     status: TeamRunStatus;
     modelHealth: ModelHealthSnapshot[];
+    /** Transient/persisted-sidecar projection used by status/TUI rendering. */
+    attentionState?: TeamAttentionState;
     workers: WorkerRun[];
     fallbackPolicy?: FallbackPolicy;
     finalSummary?: string;

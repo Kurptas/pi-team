@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import type { Message } from "@earendil-works/pi-ai";
 import { piInvocation } from "./pi-invocation.ts";
+import { isModelCapabilityDimension } from "./types.ts";
 import type {
     GeneratedTeamBlueprint,
     ModelCapabilityDimension,
@@ -27,19 +28,6 @@ interface SemanticPlanJson {
 }
 
 const CORE_TOOLS = new Set(["read", "grep", "find", "ls", "bash"]);
-const CAPABILITY_DIMENSIONS = new Set<ModelCapabilityDimension>([
-    "coding",
-    "research",
-    "fact_checking",
-    "synthesis",
-    "chinese_writing",
-    "tool_use",
-    "long_context",
-    "speed",
-    "cost_efficiency",
-    "critical_review",
-]);
-
 function finalAssistantText(messages: Message[]): string {
     for (let index = messages.length - 1; index >= 0; index--) {
         const message = messages[index];
@@ -95,9 +83,7 @@ function sanitizeTools(tools: unknown, inheritedTools: string[]): string[] {
 }
 
 function capabilityNeeds(value: unknown): ModelCapabilityDimension[] {
-    return stringList(value).filter((item): item is ModelCapabilityDimension =>
-        CAPABILITY_DIMENSIONS.has(item as ModelCapabilityDimension),
-    );
+    return stringList(value).filter((item): item is ModelCapabilityDimension => isModelCapabilityDimension(item));
 }
 
 function parseRole(role: Record<string, unknown>, index: number, inheritedTools: string[]): TeamInputRole | undefined {
@@ -112,7 +98,9 @@ function parseRole(role: Record<string, unknown>, index: number, inheritedTools:
         systemPrompt: text(role.systemPrompt, ""),
         tools: sanitizeTools(role.tools, inheritedTools),
         modelFit: text(role.modelFit, ""),
-        modelPreferences: stringList(role.modelPreferences),
+        // Semantic planning describes capabilities; it must not invent concrete
+        // provider/model keys. Only captain/user/project input may do that.
+        modelPreferences: [],
     };
 }
 
@@ -188,7 +176,7 @@ export function parseSemanticPlan(
     const roleIds = new Set(roles.map((role) => role.id ?? ""));
     const rounds = parseRounds(parsed.rounds, roleIds);
     return {
-        title: text(parsed.title, "动态协作蓝本"),
+        title: text(parsed.title, "Dynamic team blueprint"),
         rationale: text(parsed.rationale, "semantic plan generated"),
         strategy: text(
             parsed.strategy,
@@ -223,8 +211,8 @@ function capabilityFacts(profiles: ModelCapabilityProfile[]): string {
                 `  family: ${profile.family}`,
                 `  models: ${profile.models.join(", ")}`,
                 `  aliases: ${profile.aliases.join(", ")}`,
+                `  capabilities: ${profile.capabilities.join(", ")}`,
                 `  strengths: ${profile.strengths.join(", ")}`,
-                `  recommendedRoles: ${profile.recommendedRoles.join(", ")}`,
                 `  cautions: ${profile.cautions.join(", ")}`,
             ].join("\n"),
         )
@@ -233,68 +221,61 @@ function capabilityFacts(profiles: ModelCapabilityProfile[]): string {
 
 function plannerPrompt(input: TeamInput, inheritedTools: string[], profiles: ModelCapabilityProfile[], unavailableModels: string[] = []): string {
     const maxAgents = Math.max(1, Math.min(input.maxAgents ?? 4, 5));
-    const unavailableLine =
-        unavailableModels.length > 0
-            ? [
-                  "",
-                  "运行前 probe 已确认以下模型此刻不可用（超时/拒绝/鉴权失败），不要在 modelPreferences 里指定它们，改用其他健康模型：",
-                  unavailableModels.map((key) => `- ${key}`).join("\n"),
-              ].join("\n")
-            : "";
+    const unavailableLine = unavailableModels.length > 0
+        ? ["", "Runtime health has marked these configured models unavailable:", unavailableModels.map((key) => `- ${key}`).join("\n")].join("\n")
+        : "";
     return [
-        "你是 Pi team 扩展的语义规划器。你的任务是给主 Agent 队长生成一次轻量、多 Agent 协作蓝本。",
-        "主 Agent 是队长，负责推动、检查、二次调度和最终裁决；team 扩展负责派发、通信、观测和证据返回。",
+        "You are the semantic planner for the Pi team extension. Design a lightweight multi-agent blueprint for the lead captain.",
+        "The lead captain owns progress, inspection, follow-up dispatch, and final judgment. The extension provides dispatch, communication, observation, and evidence transport.",
         "",
-        "只输出 JSON，不要输出 Markdown、解释或代码块。",
+        "Return JSON only. Do not return Markdown, explanation, or code fences.",
         "",
         "JSON schema:",
         "{",
-        '  "title": "这次协作蓝本的短标题",',
-        '  "rationale": "为什么这样分工",',
-        '  "strategy": "整体执行流程，说明每一轮如何产生下一轮输入",',
+        '  "title": "short blueprint title",',
+        '  "rationale": "why these roles and rounds fit the task",',
+        '  "strategy": "how each round produces input for the next",',
         '  "roles": [',
         "    {",
         '      "id": "stable-role-id",',
-        '      "title": "角色名",',
-        '      "capability": "这个角色需要的能力",',
+        '      "title": "role title",',
+        '      "capability": "role capability",',
         '      "capabilityNeeds": ["coding|research|fact_checking|synthesis|chinese_writing|tool_use|long_context|speed|cost_efficiency|critical_review"],',
-        '      "description": "角色边界和负责事项",',
-        '      "systemPrompt": "给这个 worker 的中文系统提示",',
-        '      "tools": ["从可用工具里选择"],',
-        '      "modelFit": "什么类型的模型适合这个角色，以及原因",',
-        '      "modelPreferences": []',
+        '      "description": "responsibility and boundary",',
+        '      "systemPrompt": "English canonical worker instruction; require output in the user language",',
+        '      "tools": ["choose only from available tools"],',
+        '      "modelFit": "model-neutral capability and workload considerations"',
         "    }",
         "  ],",
         '  "rounds": [',
-        '    { "id": "stable-round-id", "type": "parallel|chain|single|fanout", "roles": ["stable-role-id"], "goal": "本轮目标", "fanout": { "expand": { "fromRoleId": "upstream-role-id", "path": "/items", "maxItems": 20, "onEmpty": "skip|fail" }, "collect": { "as": "collected-role-id" } } }',
+        '    { "id": "stable-round-id", "type": "parallel|chain|single|fanout", "roles": ["stable-role-id"], "goal": "round goal", "fanout": { "expand": { "fromRoleId": "upstream-role-id", "path": "/items", "maxItems": 20, "onEmpty": "skip|fail" }, "collect": { "as": "collected-role-id" } } }',
         "  ],",
-        '  "evidencePolicy": "证据、来源、限制和推理边界的要求",',
-        '  "modelPolicy": "模型分配原则，说明哪些能力适合哪些角色",',
-        '  "synthesisPolicy": "最终汇总和分歧处理方式",',
-        '  "progressMilestones": ["用户可理解的阶段进展"],',
-        '  "stopCriteria": "本次协作何时可以交还给主 Agent"',
+        '  "evidencePolicy": "requirements for evidence, sources, limitations, and inference boundaries",',
+        '  "modelPolicy": "capability requirements; never invent concrete provider/model keys",',
+        '  "synthesisPolicy": "how the captain should merge evidence and resolve disagreements",',
+        '  "progressMilestones": ["captain-observable milestone"],',
+        '  "stopCriteria": "when evidence is sufficient to return control to the captain"',
         "}",
         "",
-        `最多角色数: ${maxAgents}`,
-        `可用工具: ${inheritedTools.join(",") || "(none)"}`,
-        `任务模式: ${input.mode ?? "auto"}`,
-        `输出要求: ${input.outputContract ?? "findings"}`,
+        `Maximum roles: ${maxAgents}`,
+        `Available tools: ${inheritedTools.join(",") || "(none)"}`,
+        `Task mode: ${input.mode ?? "auto"}`,
+        `Output contract: ${input.outputContract ?? "findings"}`,
         "",
-        "模型能力事实（仅供队长规划参考，供应商/渠道可用性由运行前 probe 单独判断）:",
+        "Optional user/project capability facts (runtime health is evaluated separately):",
         capabilityFacts(profiles),
         unavailableLine,
         "",
-        "capabilityNeeds 只能从 schema 列出的维度中选择，用来帮助路由选择合适模型。",
-        "modelPreferences 由你根据任务、角色和模型能力事实填写；扩展只执行你的偏好并过滤客观不可用模型。",
-        "视角多样性：当多个角色是并行的独立视角（如多方评审、多角度论证），倾向为它们指定不同的模型或 provider，避免全部落到同一模型而丧失多模型视角；除非某角色确有唯一最适配的模型。",
-        "当只有唯一可用模型时，单一模型承担多个角色是可以接受的——无需多样性焦虑。",
-        "模型选择优先级：用户/captain 显式 modelPreferences 永远优先；未指定时才参考 fresh model-recommendations 与 capability facts；无匹配或推荐过期时回退 configured order。不要臆测不可验证的模型强弱。",
-        "progressMilestones 要服务于队长的 Plan-Do-Check-Act 推进，让队长能判断是否需要补查、换角色或汇总。",
-        "请依据用户任务的语义自行决定流程、角色数、角色抽象层级和轮次。角色名体现可复用的能力和责任；当用户任务要求单点核验时，角色名可以指向具体核验对象。",
-        "把扩展视为通信、控制和观测通道；最终判断、完成度判断和责任归主 Agent 队长。",
-        "每个 systemPrompt 要求 worker 说明实际使用的工具、访问是否成功、关键证据和限制。",
+        "Choose capabilityNeeds only from the schema dimensions. Do not emit modelPreferences or name a provider/model.",
+        "Describe model fit through capabilities, workload density, context needs, speed, and cost sensitivity.",
+        "Use role diversity for independent perspectives. Model/provider diversity is a runtime routing concern, not something to guess from labels.",
+        "A single configured model may serve multiple roles when no viable alternative exists.",
+        "Make progressMilestones useful for the captain's Plan-Do-Check-Act decisions.",
+        "Choose the workflow, role count, abstraction level, and rounds from the task semantics. Keep role names reusable unless the task needs a specific verification target.",
+        "Treat the extension as a communication, control, and observation channel; completion and final judgment belong to the lead captain.",
+        "Every systemPrompt must require workers to report actual tool use, access failures, evidence, uncertainty, and limitations, and to write in the user's language unless the task requires otherwise.",
         "",
-        `用户任务:\n${input.task}`,
+        `User task:\n${input.task}`,
     ].join("\n");
 }
 

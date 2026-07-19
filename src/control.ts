@@ -10,6 +10,7 @@ export interface TeamControlPaths {
     cancelFile: string;
     stateFile: string;
     observationFile: string;
+    attentionFile: string;
 }
 
 export interface TeamObservation {
@@ -36,6 +37,12 @@ export interface TeamMailboxMessage {
     system?: boolean;
 }
 
+export function teamMailboxMessageAddressesRole(message: TeamMailboxMessage, roleId: string): boolean {
+    if (message.system) return false;
+    if (message.targetRoleId !== undefined) return message.targetRoleId === roleId;
+    return message.broadcast !== false;
+}
+
 export function teamBaseDir(cwd: string): string {
     return path.join(cwd, CONFIG_DIR_NAME, "team");
 }
@@ -57,6 +64,7 @@ export function teamControlPaths(cwd: string, runId: string): TeamControlPaths {
         cancelFile: path.join(activeDir, "cancel.json"),
         stateFile: path.join(activeDir, "state.json"),
         observationFile: path.join(activeDir, "observation.json"),
+        attentionFile: path.join(activeDir, "attention-state.json"),
     };
 }
 
@@ -162,6 +170,23 @@ export async function requestWorkerCancel(
     return workerCancelFile;
 }
 
+export async function readWorkerCancelRequest(
+    cwd: string,
+    runId: string,
+    roleId: string,
+): Promise<{ at: number; runId: string; roleId: string; reason?: string } | undefined> {
+    const paths = teamControlPaths(cwd, runId);
+    const workerCancelFile = path.join(paths.activeDir, `cancel-${roleId.replace(/[^a-z0-9_-]/gi, "_")}.json`);
+    try {
+        const parsed = JSON.parse(await fs.promises.readFile(workerCancelFile, "utf-8")) as { at?: number; runId?: string; roleId?: string; reason?: string };
+        return typeof parsed.at === "number" && parsed.runId === runId && parsed.roleId === roleId
+            ? { at: parsed.at, runId, roleId, reason: parsed.reason }
+            : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
 export function isWorkerCancelRequested(cwd: string, runId: string, roleId: string): boolean {
     const paths = teamControlPaths(cwd, runId);
     const workerCancelFile = path.join(paths.activeDir, `cancel-${roleId.replace(/[^a-z0-9_-]/gi, "_")}.json`);
@@ -172,26 +197,32 @@ export async function appendTeamMessage(
     cwd: string,
     runId: string,
     message: string,
-    options: { system?: boolean } = {},
-): Promise<TeamControlPaths> {
+    options: { system?: boolean; targetRoleId?: string } = {},
+): Promise<TeamControlPaths & { requestId: string }> {
     const paths = teamControlPaths(cwd, runId);
     await fs.promises.mkdir(paths.activeDir, { recursive: true });
     const at = Date.now();
     const messageRef = crypto.randomUUID();
-    const entry: TeamMailboxMessage = { at, runId, message, messageRef, broadcast: true, system: options.system };
+    const entry: TeamMailboxMessage = {
+        at, runId, message, messageRef,
+        targetRoleId: options.targetRoleId,
+        broadcast: options.targetRoleId === undefined,
+        system: options.system,
+    };
     await fs.promises.appendFile(paths.mailboxFile, `${JSON.stringify(entry)}\n`, "utf-8");
     // Human-readable mirror: one timestamped block per message, readable with
     // the `read` tool alone. System messages stay out of the worker-visible
     // mirror so workers never read extension bookkeeping as captain directives.
     if (!options.system) {
         const stamp = new Date(at).toISOString();
+        const target = options.targetRoleId ? ` target=${options.targetRoleId}` : " broadcast";
         await fs.promises.appendFile(
             paths.mailboxTextFile,
-            `\n[captain @ ${stamp}]\n${message}\n`,
+            `\n[captain request=${messageRef}${target} @ ${stamp}]\n${message}\n`,
             "utf-8",
         );
     }
-    return paths;
+    return { ...paths, requestId: messageRef };
 }
 
 export async function readTeamMailbox(cwd: string, runId: string): Promise<TeamMailboxMessage[]> {

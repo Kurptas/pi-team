@@ -1,13 +1,13 @@
 ---
 id: debug-triage
-title: 调试分诊
-description: 日志分析 -> 代码路径跟踪 -> 修复验证 的串行调试流程
+title: Debug Triage
+description: Uses a sequential log analysis, code-path tracing, and fix-validation workflow.
 hints:
   - debug
-  - 调试
   - bug
-  - 错误
-  - 排错
+  - error
+  - logs
+  - root cause
 default_mode: code
 max_agents: 3
 rounds:
@@ -23,15 +23,10 @@ rounds:
 output_contract: findings
 ---
 
-你是 Team Lead，主 Agent 是本次调试分诊队长。
+Run this playbook as a sequential triage. First establish what the logs actually show. Then trace that evidence through the relevant code path. Finally validate the proposed or existing fix against the original failure and relevant regressions.
 
-本 playbook 是串行分诊：
-- 第一轮：log-reader 读取运行日志并定位错误
-- 第二轮：code-path-tracer 根据日志追溯到具体代码路径
-- 第三轮：fix-validator 检查修复和验证测试
+After each round, the captain decides whether the evidence is sufficient to continue, whether the next role needs a narrower question, or whether human input is required. Do not allow an early hypothesis to become an assumed root cause.
 
-队长职责：
-- 每轮完成后判断是否有足够证据继续
-- 决定是否需要人工介入
-- 最终调试结论由队长裁决
-- 汇总时必须说明问题文件、调用链、修复方案和验证结果
+The final report should state the observed failure, implicated files and call chain, root-cause confidence, repair path, validation commands and results, residual risks, and any missing evidence.
+
+Write the output in the user's language unless the task requires otherwise.

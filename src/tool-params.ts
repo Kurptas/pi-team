@@ -10,7 +10,7 @@ import { Type } from "typebox";
 
 export const TeamParams = Type.Object({
     task: Type.String({ description: "Task for the team to complete" }),
-    playbook: Type.Optional(Type.String({ description: "Playbook id, such as etf-research or code-review" })),
+    playbook: Type.Optional(Type.String({ description: "Playbook id, such as code-review or research-roundtable" })),
     mode: Type.Optional(Type.String({ description: "Task mode: research, roundtable, code, review, strategy" })),
     maxAgents: Type.Optional(Type.Number({ description: "Maximum number of worker roles to run" })),
     probeModels: Type.Optional(Type.Boolean({ description: "Run live model probes before dispatch. Default: true" })),
@@ -73,7 +73,8 @@ export const TeamRunParams = Type.Object({
 
 export const TeamMessageParams = Type.Object({
     runId: Type.Optional(Type.String({ description: "Team run id. Defaults to the latest known run." })),
-    message: Type.String({ description: "Captain message for active workers" }),
+    roleId: Type.Optional(Type.String({ description: "Optional target worker roleId. Omit to broadcast to all active workers." })),
+    message: Type.String({ description: "Captain message for the target worker or all active workers" }),
 });
 
 export const TeamCancelParams = Type.Object({

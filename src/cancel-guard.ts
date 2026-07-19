@@ -67,9 +67,9 @@ export function guardCancelLastWorker(
             runningCount,
             message:
                 `⚠ ${roleId} is the LAST running worker in run ${runId}. Canceling it ends all live ` +
-                `execution this round and produces NO new evidence. If a worker looks stale, confirm it is ` +
-                `genuinely stuck (live:stuck across MULTIPLE polls, not a first-poll silence while it composes ` +
-                `a long answer) before canceling. To proceed, call again with confirm:true.`,
+                `execution this round and produces NO new evidence. Treat live:no-delta as corroborating ` +
+                `evidence, not a stuck verdict; weigh communication age, pending requests, last tool, scope, ` +
+                `and cost before canceling. To proceed, call again with confirm:true.`,
         };
     }
     return { ok: true };

@@ -4,8 +4,10 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const sessionHarness = vi.hoisted(() => ({
-    behaviors: {} as Record<string, Array<{ error?: string; output?: string; toolName?: string; toolError?: boolean }>>,
+    behaviors: {} as Record<string, Array<{ error?: string; output?: string; toolName?: string; toolError?: boolean; promptDelayMs?: number }>>,
     calls: [] as string[],
+    sentUserMessages: [] as Array<{ key: string; content: string; deliverAs?: string }>,
+    timeline: [] as string[],
     onCreate: undefined as undefined | ((key: string) => void),
 }));
 
@@ -27,6 +29,9 @@ vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => {
                     return () => listeners.delete(listener);
                 },
                 async prompt() {
+                    sessionHarness.timeline.push(`prompt-start:${key}`);
+                    for (const listener of [...listeners]) listener({ type: "message_start" });
+                    if (behavior.promptDelayMs) await new Promise((resolve) => setTimeout(resolve, behavior.promptDelayMs));
                     if (behavior.toolName) {
                         for (const listener of [...listeners]) listener({ type: "tool_execution_start", toolName: behavior.toolName });
                         for (const listener of [...listeners]) listener({
@@ -50,7 +55,10 @@ vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => {
                     for (const listener of [...listeners]) listener({ type: "message_end", message });
                     for (const listener of [...listeners]) listener({ type: "agent_end", messages: [message] });
                 },
-                async sendUserMessage() {},
+                async sendUserMessage(content: unknown, sendOptions?: { deliverAs?: string }) {
+                    sessionHarness.timeline.push(`captain-delivery:${key}`);
+                    sessionHarness.sentUserMessages.push({ key, content: String(content), deliverAs: sendOptions?.deliverAs });
+                },
                 dispose() {},
             };
             return { session } as any;
@@ -122,6 +130,8 @@ function run(runId: string): TeamRun {
 beforeEach(() => {
     clearModelHealthCache();
     sessionHarness.calls.length = 0;
+    sessionHarness.sentUserMessages.length = 0;
+    sessionHarness.timeline.length = 0;
     sessionHarness.behaviors = {};
     sessionHarness.onCreate = undefined;
 });
@@ -224,6 +234,45 @@ describe("runTeamPlan model-preparation integration", () => {
         ]);
         expect(result.events?.filter((event) => event.phase === "model-decision-window-override")).toHaveLength(2);
         expect(result.events?.some((event) => event.phase === "model-decision-window-timeout")).toBe(false);
+    });
+
+    it("actively injects a targeted captain request into only the addressed worker session", async () => {
+        const cwd = tempDir();
+        const initial = run("team_targeted_delivery_integration");
+        const prepared = await prepareTeamControl(cwd, initial);
+        const request = await appendTeamMessage(cwd, initial.runId, "finish now", { targetRoleId: "a" });
+        sessionHarness.behaviors["p/a"] = [{ output: "a done", promptDelayMs: 30 }];
+        sessionHarness.behaviors["p/b"] = [{ output: "b done", promptDelayMs: 30 }];
+
+        const result = await runTeamPlan(cwd, plan([
+            role("a", { selectedModel: "p/a" }), role("b", { selectedModel: "p/b" }),
+        ]), prepared, {
+            inheritedTools: ["read"], modelRegistry: registry(["p/a", "p/b"]),
+        });
+
+        const deliveries = sessionHarness.sentUserMessages.filter((message) => message.content.includes(`Captain request ${request.requestId}:`));
+        expect(deliveries).toEqual([expect.objectContaining({ key: "p/a", deliverAs: "steer" })]);
+        expect(sessionHarness.timeline.indexOf("prompt-start:p/a")).toBeLessThan(sessionHarness.timeline.indexOf("captain-delivery:p/a"));
+        expect(result.workers.find((worker) => worker.roleId === "a")).toMatchObject({
+            lastCaptainMessageRef: request.requestId,
+            lastCaptainDeliveredRef: request.requestId,
+        });
+        expect(result.workers.find((worker) => worker.roleId === "b")?.lastCaptainMessageRef).toBeUndefined();
+    });
+
+    it("preserves an ACK emitted before mailbox polling creates the request ledger", async () => {
+        const cwd = tempDir();
+        const initial = run("team_early_ack_integration");
+        const prepared = await prepareTeamControl(cwd, initial);
+        const request = await appendTeamMessage(cwd, initial.runId, "ack this", { targetRoleId: "a" });
+        sessionHarness.behaviors["p/a"] = [{ output: `RADIO: ack=${request.requestId}; status=received\nresult_summary: done` }];
+        const result = await runTeamPlan(cwd, plan([role("a", { selectedModel: "p/a" })]), prepared, {
+            inheritedTools: ["read"], modelRegistry: registry(["p/a"]),
+        });
+        expect(result.workers[0]?.captainRequests?.[request.requestId]).toMatchObject({
+            requestRef: request.requestId,
+            ackedAt: expect.any(Number),
+        });
     });
 
     it("dispatches the selected auto-fallback after a task-first decision timeout", async () => {

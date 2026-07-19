@@ -5,7 +5,7 @@
 import { selectModelsToProbe, resolveProbeResults, type ConfiguredModel, type ProbeSet, type ResolvedProbeResult } from "./model-selection.ts";
 import { probeModels, type ProbeModel } from "./prober.ts";
 import { freshModelHealth, recordModelHealth } from "./model-health-cache.ts";
-import type { FallbackPolicy, ModelHealthSnapshot, PlannedRole, TeamModel, TeamPlan } from "./types.ts";
+import type { FallbackPolicy, ModelCapabilityProfile, ModelHealthSnapshot, PlannedRole, TeamModel, TeamPlan } from "./types.ts";
 
 export interface ProbeResult {
     probeSet: ProbeSet;
@@ -18,15 +18,17 @@ export async function probePlan(
     plan: TeamPlan,
     configuredModels: ConfiguredModel[],
     availableModels: TeamModel[],
-    defaultsDir: string,
     fallbackPolicy: FallbackPolicy,
     directDispatch: boolean,
     probe: ProbeModel,
     signal?: AbortSignal,
     useHealthCache = true,
+    capabilityProfiles: ModelCapabilityProfile[] = [],
 ): Promise<ProbeResult> {
     const allRoles: PlannedRole[] = plan.rounds.flatMap((round) => round.roles);
-    const probeSet = selectModelsToProbe(allRoles, configuredModels, defaultsDir, fallbackPolicy, directDispatch);
+    const probeSet = selectModelsToProbe(
+        allRoles, configuredModels, fallbackPolicy, directDispatch, availableModels, capabilityProfiles,
+    );
 
     const targetKeys = probeSet.models.map((model) => model.key);
     const candidateKeys = new Set((probeSet.rolePlans ?? []).flatMap((role) => role.candidates.map((candidate) => candidate.key)));

@@ -3,7 +3,7 @@ import { truncateToWidth, visibleWidth, type Component } from "@earendil-works/p
 import { buildTeamStatusProjection, type ProjectedWorker } from "./status-projection.ts";
 import type { TeamRun } from "./types.ts";
 
-const TEAM_WIDGET_VISIBLE_WORKERS = 3;
+const TEAM_WIDGET_VISIBLE_WORKERS = 4;
 
 export function isTerminalStatus(status: TeamRun["status"]): boolean {
     return status === "succeeded" || status === "degraded" || status === "stopped" || status === "failed";
@@ -20,6 +20,7 @@ export function statusGlyph(worker: Pick<ProjectedWorker, "status" | "stale">): 
     if (worker.status === "running") return { glyph: "●", color: "accent" };
     if (worker.status === "succeeded") return { glyph: "✓", color: "success" };
     if (worker.status === "failed") return { glyph: "✗", color: "error" };
+    if (worker.status === "degraded") return { glyph: "◐", color: "warning" };
     if (worker.status === "skipped") return { glyph: "⊘", color: "muted" };
     return { glyph: "•", color: "warning" };
 }
@@ -43,14 +44,16 @@ export function compactModelThinking(worker: ProjectedWorker, width: number): st
 }
 
 export function workerCompactLine(worker: ProjectedWorker, theme: Theme): string {
-    const glyph = statusGlyph(worker);
+    const glyph = worker.attentionDebt ? { glyph: "⚠", color: "warning" as const } : statusGlyph(worker);
     const title = padVisible(worker.title, 18);
     const model = padVisible(compactModelThinking(worker, 16), 16);
-    const signal = worker.status === "running" ? `·${durationLabel(worker.signalAgeSeconds)}` : "";
+    const communication = worker.status === "running" ? `comm:${durationLabel(worker.communicationAgeSeconds)}` : "";
+    const pendingDelivery = worker.status === "running" && worker.pendingDeliveryRef ? ` QUEUED:${fitVisible(worker.pendingDeliveryRef, 12)}` : "";
+    const pendingAck = worker.status === "running" && worker.pendingAckRef ? ` AWAITING_ACK:${fitVisible(worker.pendingAckRef, 12)}` : "";
     const exit = worker.status === "failed" ? ` exit:${worker.exitCode ?? "?"}` : "";
     const activity = worker.status === "running" && worker.activity ? ` ${worker.activity.replace(/^tool:/, "")}` : "";
     const report = worker.status === "running" && worker.lastReportPreview ? ` report:${fitVisible(worker.lastReportPreview, 48)}` : "";
-    return `${theme.fg(glyph.color, glyph.glyph)} ${title} ${theme.fg("dim", model)} ${durationLabel(worker.elapsedSeconds)} ${theme.fg("dim", signal)}${theme.fg(worker.status === "failed" ? "error" : "dim", `${exit}${activity}${report}`)}`.trimEnd();
+    return `${theme.fg(glyph.color, glyph.glyph)} ${title} ${theme.fg("dim", model)} ${durationLabel(worker.elapsedSeconds)} ${theme.fg("dim", communication)}${theme.fg(worker.status === "failed" ? "error" : pendingDelivery || pendingAck ? "warning" : "dim", `${pendingDelivery}${pendingAck}${exit}${activity}${report}`)}`.trimEnd();
 }
 
 export function teamCountSummary(run: TeamRun, theme?: Theme): string {
@@ -64,14 +67,20 @@ export function teamCountSummary(run: TeamRun, theme?: Theme): string {
         `${paint("accent", "●")} ${counts.active}`,
         `${paint("error", "✗")} ${counts.failed}`,
     ];
+    if (counts.degraded) parts.push(`${paint("warning", "◐")} ${counts.degraded} degraded`);
     if (counts.skipped) parts.push(`${paint("muted", "⊘")} ${counts.skipped}`);
+    if (counts.attentionDebt) parts.push(`${paint("warning", "attention")} ${counts.attentionDebt}`);
     if (counts.stale) parts.push(`${paint("warning", "stale")} ${counts.stale}`);
     return parts.join(" · ");
 }
 
+export function teamPlanLabel(playbookId: string): string {
+    return playbookId === "generated-blueprint" ? "custom-plan" : playbookId;
+}
+
 export function compactTeamLine(run: TeamRun, theme: Theme): string {
     const statusColor = run.status === "failed" ? "error" : run.status === "degraded" || run.status === "stopped" ? "warning" : isTerminalStatus(run.status) ? "success" : "accent";
-    return `${theme.fg("toolTitle", theme.bold("team"))} ${theme.fg(statusColor, run.status)} ${theme.fg("dim", run.playbookId)} · ${teamCountSummary(run, theme)}`;
+    return `${theme.fg("toolTitle", theme.bold("team"))} ${theme.fg(statusColor, run.status)} ${theme.fg("dim", teamPlanLabel(run.playbookId))} · ${teamCountSummary(run, theme)}`;
 }
 
 export function truncatedLines(lines: string[]): Component {
@@ -83,12 +92,29 @@ export function truncatedLines(lines: string[]): Component {
     };
 }
 
+export function orderProjectedWorkers(workers: ProjectedWorker[]): ProjectedWorker[] {
+    const priority = (worker: ProjectedWorker) => worker.attentionDebt ? 0 : worker.status === "running" ? 1 : worker.status === "pending" ? 2 : worker.status === "failed" || worker.status === "degraded" ? 3 : 4;
+    const debtAge = (worker: ProjectedWorker) => worker.cancelPendingAgeSeconds ?? worker.pendingDeliveryAgeSeconds ?? worker.pendingAckAgeSeconds ?? worker.communicationAgeSeconds ?? 0;
+    return workers.map((worker, index) => ({ worker, index }))
+        .sort((a, b) => priority(a.worker) - priority(b.worker) || debtAge(b.worker) - debtAge(a.worker) || a.index - b.index)
+        .map(({ worker }) => worker);
+}
+
 export function teamWidgetLines(run: TeamRun, theme: Theme): string[] {
     const projection = buildTeamStatusProjection(run, []);
-    const shown = projection.workers.slice(0, TEAM_WIDGET_VISIBLE_WORKERS);
-    const more = Math.max(0, projection.workers.length - shown.length);
+    const ordered = orderProjectedWorkers(projection.workers);
+    const shown = ordered.slice(0, TEAM_WIDGET_VISIBLE_WORKERS);
+    const hidden = ordered.slice(shown.length);
     const lines = [compactTeamLine(run, theme), ...shown.map((worker) => workerCompactLine(worker, theme))];
-    if (more > 0) lines.push(theme.fg("dim", `… ${more} more worker(s)`));
+    if (hidden.length > 0) {
+        const active = hidden.filter((worker) => worker.status === "running");
+        const pending = hidden.filter((worker) => worker.status === "pending");
+        const debt = hidden.filter((worker) => worker.attentionDebt);
+        const debtLabel = debt.length > 0 ? `; attention:${debt.length} [${debt.map((worker) => worker.roleId).join(", ")}]` : "";
+        const activeLabel = active.length > 0 ? `; ${active.length} active: ${active.map((worker) => worker.roleId).join(", ")}` : "";
+        const pendingLabel = pending.length > 0 ? `; ${pending.length} pending: ${pending.map((worker) => worker.roleId).join(", ")}` : "";
+        lines.push(theme.fg(debt.length > 0 ? "warning" : "dim", `… ${hidden.length} more worker(s)${activeLabel}${pendingLabel}${debtLabel}`));
+    }
     return lines;
 }
 
@@ -99,7 +125,7 @@ export function teamWidget(run: TeamRun, theme: Theme): Component {
 export function renderTeamDetails(run: TeamRun, theme: Theme): Component {
     const projection = buildTeamStatusProjection(run, []);
     const lines = [compactTeamLine(run, theme)];
-    for (const worker of projection.workers) {
+    for (const worker of orderProjectedWorkers(projection.workers)) {
         const output = worker.outputKind ? ` output:${worker.outputKind}` : "";
         const route = worker.routingReason ? ` route:${fitVisible(worker.routingReason, 96)}` : "";
         const summary = worker.status !== "running" && worker.factualPreview ? ` summary:${worker.factualPreview}` : "";

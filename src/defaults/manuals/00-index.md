@@ -30,6 +30,8 @@ manuals:
 
 This directory lists all pi-team role manuals and task SOPs.
 
+Canonical runtime resources under `src/defaults` are written in English and built-in roles and playbooks are model-neutral. Localized documentation is maintained separately and is not part of the canonical runtime resource set.
+
 ## Directory Convention
 
 | Path | Role | auto-inject | Description |

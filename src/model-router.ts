@@ -68,7 +68,8 @@ function routingReason(role: PlannedRole, model: TeamModel | undefined, profiles
         role.modelPreferences.length > 0
             ? `lead preference ${role.modelPreferences.join(", ")}`
             : "no lead model preference supplied";
-    if (!profile) return `selected ${modelKey(model)}; ${preferenceNote}; no local capability facts matched`;
+    const runtimeFacts = `reasoning=${model.reasoning}; context=${model.contextWindow ?? "unknown"}; maxTokens=${model.maxTokens ?? "unknown"}`;
+    if (!profile) return `selected ${modelKey(model)}; ${preferenceNote}; ${runtimeFacts}; no local capability facts matched; lead remains final judge`;
     const needs = role.capabilityNeeds.length > 0 ? role.capabilityNeeds.join(", ") : "no role capability tags";
     const strengths = profile.strengths.length > 0 ? `strengths=${profile.strengths.join(", ")}` : "strengths=(none)";
     const cautions = profile.cautions.length > 0 ? `cautions=${profile.cautions.join(", ")}` : "cautions=(none)";
@@ -147,6 +148,9 @@ export function toTeamModels(models: Model<Api>[]): TeamModel[] {
         id: model.id,
         name: model.name,
         reasoning: model.reasoning,
+        input: model.input,
         cost: model.cost,
+        contextWindow: model.contextWindow,
+        maxTokens: model.maxTokens,
     }));
 }

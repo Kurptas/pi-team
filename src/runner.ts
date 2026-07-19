@@ -4,6 +4,7 @@ import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { Message, Model } from "@earendil-works/pi-ai";
 import { createAgentSession } from "@earendil-works/pi-coding-agent";
 import { persistBlueprintArtifact } from "./blueprint-store.ts";
+import { acknowledgeCaptainRequests, captainRequestSnapshot, captainRequestSteerText, deliverCaptainRequests } from "./captain-request-delivery.ts";
 import { validateTeamPlanGraph } from "./plan-graph.ts";
 import { initialQueue, newlySchedulableRounds, undispatchedRounds } from "./plan-schedule.ts";
 import { validateSpawnRole } from "./spawn-validate.ts";
@@ -56,6 +57,7 @@ import {
     prepareTeamControl,
     readTeamMailbox,
     teamControlPaths,
+    teamMailboxMessageAddressesRole,
     teamRunLogDir,
     writeTeamState,
 } from "./control.ts";
@@ -240,6 +242,10 @@ function workerContextPrompt(context: WorkerPromptContext | undefined): string[]
         "- Include the model and tools above in your final output when the task asks for actual runtime evidence.",
     ];
 }
+export function radioAcknowledgedRequestIds(text: string): string[] {
+    return [...text.matchAll(/(?:^|[;\s,])ack\s*[:=]\s*([A-Za-z0-9._-]+)/gi)].map((match) => match[1]!);
+}
+
 export function workerRadioPrompt(systemPrompt: string, context?: WorkerPromptContext): string {
     return [
         systemPrompt,
@@ -253,7 +259,8 @@ export function workerRadioPrompt(systemPrompt: string, context?: WorkerPromptCo
         "- Report progress to the captain in short assistant messages at meaningful milestones: started, source/tool selected, evidence found, blocked, final.",
         `- Start every progress report with "${RADIO_REPORT_PREFIX}" so the captain can distinguish radio updates from normal final output.`,
         "- Each progress report should include: status, current action, tool or URL when relevant, blocker if any, and next step.",
-        "- Check for captain instructions by using the `read` tool on the human-readable mailbox file at meaningful milestones; state how you adjusted. A shell is not required.",
+        "- Check for captain instructions by using the `read` tool on the human-readable mailbox file at meaningful milestones. Each captain block includes a request id and either a target role or broadcast marker.",
+        `- Act on requests addressed to your role or marked broadcast. Acknowledge the newest addressed request in your next report using "${RADIO_REPORT_PREFIX} ack=<request-id>; status=..." before stating how you adjusted. A shell is not required.`,
         "- Final output must still follow the requested structured finding fields; unless the role/task explicitly asks for a long report, keep final output concise: result summary, key evidence refs, limitations/disagreements, confidence, and next questions.",
         "- When searching code or files, use the search tools available to you (`grep`/`find`/`ls` if present; otherwise use `bash` search commands such as `rg`/`find`). Exclude the team's own run artifacts under `.pi/team/` or `.omp/team/` — they are prior-run exhaust, not source evidence, and reading them wastes budget.",
     ].join("\n");
@@ -346,6 +353,7 @@ async function runWorker(
     }
     let sessionDisposer: (() => void) | undefined;
     let cleanupTimers: (() => void) | undefined;
+    let captainPollPromise: Promise<void> | undefined;
     try {
         if (role.selectedModel && !workerModel) {
             throw new Error(`selected model '${role.selectedModel}' was not found in Pi model registry`);
@@ -380,11 +388,12 @@ async function runWorker(
                 safetyCeilingTimer = undefined;
             }
         };
-        // --------------------------------------------------------------------
-        // Captain message polling
-        // --------------------------------------------------------------------
         let captainTimer: ReturnType<typeof setInterval> | undefined;
-        const pollCaptainMessages = async () => {
+        let primaryPromptStarted = false;
+        let captainDeliveryClosed = false;
+        let injectCaptainRequest: ((requestId: string, message: string) => Promise<boolean>) | undefined;
+        const pollCaptainMessagesOnce = async () => {
+            if (captainDeliveryClosed || !primaryPromptStarted) return;
             if (isTeamCancelRequested(cwd, runId) || isWorkerCancelRequested(cwd, runId, role.roleId)) {
                 emitWorkerUpdate({
                     phase: "worker-cancel-requested",
@@ -394,25 +403,32 @@ async function runWorker(
                 abortWorker();
                 return;
             }
-            const messagesFromCaptain = (await readTeamMailbox(cwd, runId)).filter((msg) => !msg.system);
-            if (messagesFromCaptain.length <= seenCaptainMessages) return;
-            const latest = messagesFromCaptain[messagesFromCaptain.length - 1];
-            seenCaptainMessages = messagesFromCaptain.length;
-            runningWorker.lastCaptainMessageAt = latest.at;
-            runningWorker.lastCaptainMessagePreview = textPreview(latest.message);
-            emitWorkerUpdate({
-                phase: "captain-message-available",
-                message: `${role.title} has a captain message available in mailbox`,
-                preview: textPreview(latest.message),
+            const messagesFromCaptain = (await readTeamMailbox(cwd, runId)).filter((msg) =>
+                teamMailboxMessageAddressesRole(msg, role.roleId),
+            );
+            if (messagesFromCaptain.length <= seenCaptainMessages || !injectCaptainRequest) return;
+            seenCaptainMessages = await deliverCaptainRequests({
+                messages: messagesFromCaptain,
+                seen: seenCaptainMessages,
+                worker: runningWorker,
+                inject: injectCaptainRequest,
+                emit: emitWorkerUpdate,
             });
         };
+        const pollCaptainMessages = () => {
+            if (captainPollPromise) return captainPollPromise;
+            const current = pollCaptainMessagesOnce();
+            const tracked = current.finally(() => {
+                if (captainPollPromise === tracked) captainPollPromise = undefined;
+            });
+            captainPollPromise = tracked;
+            return tracked;
+        };
         cleanupTimers = () => {
+            captainDeliveryClosed = true;
             cleanupTimeout();
             if (captainTimer) clearInterval(captainTimer);
         };
-        // --------------------------------------------------------------------
-        // Race: session startup vs abort
-        // --------------------------------------------------------------------
         const { session } = await Promise.race([
             sessionPromise,
             new Promise<never>((_resolve, reject) => {
@@ -420,6 +436,15 @@ async function runWorker(
                 sessionAbortSignal.addEventListener("abort", onAbort, { once: true });
             }),
         ]);
+        injectCaptainRequest = async (requestId, message) => {
+            try {
+                if (captainDeliveryClosed || !primaryPromptStarted) return false;
+                await session.sendUserMessage(captainRequestSteerText(requestId, message), { deliverAs: "steer" });
+                return !captainDeliveryClosed;
+            } catch {
+                return false;
+            }
+        };
         // Guard against double-dispose: the abort path and the finally block
         // can both fire on an aborted worker. Wrap so session.dispose() runs at
         // most once even if Pi's dispose is not idempotent.
@@ -435,6 +460,7 @@ async function runWorker(
             runningWorker.lastSignalAt = Date.now();
             switch (event.type) {
                 case "message_start":
+                    primaryPromptStarted = true;
                     emitWorkerUpdate({
                         phase: "worker-message-start",
                         message: `${role.title} message started`,
@@ -472,8 +498,10 @@ async function runWorker(
                         runningWorker.lastOutputPreview = textPreview(output);
                     }
                     if (currentText && isRadioReport(currentText)) {
-                        runningWorker.lastReportAt = Date.now();
+                        const reportAt = Math.max(Date.now(), (runningWorker.lastReportAt ?? 0) + 1);
+                        runningWorker.lastReportAt = reportAt;
                         runningWorker.lastReportPreview = textPreview(currentText);
+                        acknowledgeCaptainRequests(runningWorker, radioAcknowledgedRequestIds(currentText), reportAt);
                     }
                     runningWorker.lastEvent = "message_end";
                     emitWorkerUpdate({
@@ -523,13 +551,6 @@ async function runWorker(
                     break;
             }
         });
-        // --------------------------------------------------------------------
-        // Captain polling + timeout
-        // --------------------------------------------------------------------
-        captainTimer = setInterval(() => {
-            void pollCaptainMessages();
-        }, CAPTAIN_MESSAGE_POLL_MS);
-        void pollCaptainMessages();
         // SOFT threshold: the tool does NOT stop the worker. It only flags the
         // run as long-running and notifies the captain, who owns the decision to
         // team_cancel_worker or let it continue. Multi-round / complex tasks
@@ -588,12 +609,14 @@ async function runWorker(
             `- Read this plain-text mailbox with the read tool: ${controlPaths.mailboxTextFile}`,
             `- Raw JSONL mailbox (optional, for tooling): ${controlPaths.mailboxFile}`,
             "- Open the plain-text mailbox with the read tool at meaningful milestones. It is empty until the captain sends something.",
-            "- If the captain has left a message, acknowledge it in your next RADIO report and adjust within your role boundary.",
+            `- If the captain has left a request addressed to role ${role.roleId} or marked broadcast, acknowledge it in your next RADIO report using "${RADIO_REPORT_PREFIX} ack=<request-id>; status=..." and adjust within your role boundary.`,
         ].join("\n");
-        // --------------------------------------------------------------------
-        // Run worker
-        // --------------------------------------------------------------------
-        await session.prompt(taskMessage);
+        // Start the primary task before mailbox steering so a pre-existing
+        // request cannot trigger a turn without the worker task instructions.
+        const workerPrompt = session.prompt(taskMessage);
+        captainTimer = setInterval(() => { void pollCaptainMessages(); }, CAPTAIN_MESSAGE_POLL_MS);
+        void pollCaptainMessages();
+        await workerPrompt;
         // Wait for agent_end
         await new Promise<void>((resolve) => {
             const check = () => {
@@ -616,6 +639,7 @@ async function runWorker(
         // Cleanup
         // --------------------------------------------------------------------
         cleanupTimers();
+        await captainPollPromise?.catch(() => {});
         unsubscribe();
         if (sessionAbortSignal.aborted && !wasAborted) {
             wasAborted = true;
@@ -652,8 +676,7 @@ async function runWorker(
             lastSignalAt: runningWorker.lastSignalAt,
             lastReportAt: runningWorker.lastReportAt,
             lastReportPreview: runningWorker.lastReportPreview,
-            lastCaptainMessageAt: runningWorker.lastCaptainMessageAt,
-            lastCaptainMessagePreview: runningWorker.lastCaptainMessagePreview,
+            ...captainRequestSnapshot(runningWorker),
             lastOutputPreview: output ? textPreview(output) : undefined,
             outputKind,
             ...structured,
@@ -701,8 +724,7 @@ async function runWorker(
             lastSignalAt: runningWorker.lastSignalAt,
             lastReportAt: runningWorker.lastReportAt,
             lastReportPreview: runningWorker.lastReportPreview,
-            lastCaptainMessageAt: runningWorker.lastCaptainMessageAt,
-            lastCaptainMessagePreview: runningWorker.lastCaptainMessagePreview,
+            ...captainRequestSnapshot(runningWorker),
             lastOutputPreview: caughtOutput ? textPreview(caughtOutput) : undefined,
             outputKind: caughtOutputKind,
             ...caughtStructured,
@@ -726,6 +748,8 @@ async function runWorker(
                 : undefined,
         };
     } finally {
+        cleanupTimers?.();
+        await captainPollPromise?.catch(() => {});
         removeSignalAbortListener?.();
         sessionDisposer?.();
     }

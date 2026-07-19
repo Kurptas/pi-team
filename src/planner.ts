@@ -25,10 +25,7 @@ function slug(value: string, fallback: string): string {
 }
 
 export function selectPlaybook(input: TeamInput, playbooks: Playbook[]): Playbook | undefined {
-    if (input.playbook) {
-        const explicit = playbooks.find((playbook) => playbook.id === input.playbook);
-        if (explicit) return explicit;
-    }
+    if (input.playbook) return playbooks.find((playbook) => playbook.id === input.playbook);
     return playbooks.find((playbook) => playbook.id === "research-roundtable") ?? playbooks[0];
 }
 
@@ -70,7 +67,7 @@ function plannedRole(objective: string, playbook: Playbook, role: RoleSpec, roun
         roleId: role.id,
         title: role.title,
         description: role.description,
-        capabilityNeeds: NO_CAPABILITY_NEEDS,
+        capabilityNeeds: role.capabilityNeeds,
         task: roleTask(objective, playbook, role, roundGoal),
         tools: role.tools,
         systemPrompt: role.body,
@@ -98,20 +95,22 @@ function roleFromInput(role: TeamInputRole, index: number, mode?: string): RoleS
         title,
         description,
         tools: role.tools ?? defaultTools,
+        capabilityNeeds: role.capabilityNeeds ?? NO_CAPABILITY_NEEDS,
         modelPreferences: role.modelPreferences ?? [],
         thinkingLevel: role.thinking ?? (REVIEW_MODES.has(mode ?? "") ? "high" : undefined),
         outputSchema: "worker_finding",
         body:
             role.systemPrompt?.trim() ||
             [
-                `你是${title}。`,
-                capability ? `核心能力：${capability}` : undefined,
+                `You are the ${title}.`,
+                capability ? `Core capability: ${capability}` : undefined,
                 description,
-                role.capabilityNeeds?.length ? `能力需求标签：${role.capabilityNeeds.join(", ")}` : undefined,
-                modelFit ? `模型适配考虑：${modelFit}` : undefined,
+                role.capabilityNeeds?.length ? `Capability needs: ${role.capabilityNeeds.join(", ")}` : undefined,
+                modelFit ? `Model-fit considerations: ${modelFit}` : undefined,
                 "",
-                "严格围绕当前任务履行这个角色边界，输出可核查、可合并的结构化发现。",
-                "说明证据来源、判断依据、置信度、分歧点和需要继续验证的问题。",
+                "Stay within this role boundary and return verifiable, mergeable structured findings.",
+                "State evidence sources, reasoning, confidence, disagreements, and questions that still need verification.",
+                "Write the output in the user's language unless the task requires otherwise.",
             ]
                 .filter((line): line is string => line !== undefined)
                 .join("\n"),
@@ -166,14 +165,14 @@ function generatedPlaybook(
 ): Playbook {
     return {
         id: GENERATED_PLAYBOOK_ID,
-        title: blueprint?.title.trim() || "动态协作蓝本",
-        description: blueprint?.rationale.trim() || "主 Agent 根据任务现场生成的协作蓝本",
+        title: blueprint?.title.trim() || "Dynamic team blueprint",
+        description: blueprint?.rationale.trim() || "A task-specific collaboration blueprint generated for the lead captain",
         hints: [],
         defaultMode: input.mode ?? "research",
         maxAgents: Math.max(1, input.maxAgents ?? roles.length),
         rounds: generatedRoleRounds(input, blueprint, roles),
         outputContract: input.outputContract ?? "findings",
-        body: blueprint?.strategy.trim() || "主 Agent 动态生成协作计划，扩展负责分派、通信、观测和记录。",
+        body: blueprint?.strategy.trim() || "The lead captain generated this collaboration plan; the extension handles dispatch, communication, observation, and recording.",
         source: "project",
         filePath: "(generated)",
     };
@@ -208,7 +207,7 @@ export function createTeamPlan(
                 return {
                     ...planned,
                     capability: sourceRole?.capability?.trim(),
-                    capabilityNeeds: roleCapabilityNeeds(sourceRole),
+                    capabilityNeeds: sourceRole ? roleCapabilityNeeds(sourceRole) : planned.capabilityNeeds,
                     modelFit: sourceRole?.modelFit?.trim(),
                     thinkingLevel: planned.thinkingLevel ?? (REVIEW_MODES.has(input.mode ?? "") ? "high" : undefined),
                     dependsOn: sourceRole?.dependsOn,

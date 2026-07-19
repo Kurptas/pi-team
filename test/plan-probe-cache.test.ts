@@ -1,12 +1,9 @@
-import * as path from "node:path";
-import { fileURLToPath } from "node:url";
 import { beforeEach, describe, expect, it } from "vitest";
 import { clearModelHealthCache, recordModelHealth } from "../src/model-health-cache.ts";
 import { probePlan } from "../src/plan-probe.ts";
 import type { ConfiguredModel } from "../src/model-selection.ts";
 import type { TeamModel, TeamPlan } from "../src/types.ts";
 
-const defaultsDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src", "defaults");
 const configured: ConfiguredModel[] = [{ key: "provider/model", provider: "provider", id: "model", name: "Model" }];
 const available: TeamModel[] = [{ provider: "provider", id: "model", name: "Model", reasoning: true, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }];
 const plan: TeamPlan = {
@@ -23,7 +20,7 @@ describe("probe plan health cache", () => {
     it("skips the network probe when recent health exists", async () => {
         recordModelHealth({ model: "provider/model", provider: "provider", status: "probe_passed", latencyMs: 1, checkedAt: Date.now() });
         let calls = 0;
-        const result = await probePlan(plan, configured, available, defaultsDir, "strict", true, async () => {
+        const result = await probePlan(plan, configured, available, "strict", true, async () => {
             calls += 1;
             throw new Error("should not probe");
         });
@@ -46,7 +43,7 @@ describe("probe plan health cache", () => {
             { id: "merge", type: "single", roles: [{ ...dependent.rounds[0]!.roles[0]!, roleId: "merge", modelPreferences: ["provider/merge"], dependsOn: ["evidence"] }] },
         ];
         const calls: string[] = [];
-        const result = await probePlan(dependent, models, teamModels, defaultsDir, "task_first", true, async (model) => {
+        const result = await probePlan(dependent, models, teamModels, "task_first", true, async (model) => {
             calls.push(`${model.provider}/${model.id}`);
             return { model: `${model.provider}/${model.id}`, provider: model.provider, status: "probe_passed", latencyMs: 1, checkedAt: Date.now() };
         });
@@ -68,7 +65,7 @@ describe("probe plan health cache", () => {
             latencyMs: 1, checkedAt: Date.now(), reason: "model not found",
         });
         const calls: string[] = [];
-        const result = await probePlan(plan, models, teamModels, defaultsDir, "task_first", true, async (model) => {
+        const result = await probePlan(plan, models, teamModels, "task_first", true, async (model) => {
             calls.push(`${model.provider}/${model.id}`);
             return { model: `${model.provider}/${model.id}`, provider: model.provider, status: "probe_passed", latencyMs: 1, checkedAt: Date.now() };
         });
@@ -80,7 +77,7 @@ describe("probe plan health cache", () => {
     it("honors cache bypass when probeModels is disabled", async () => {
         recordModelHealth({ model: "provider/model", provider: "provider", status: "probe_passed", latencyMs: 1, checkedAt: Date.now() });
         let calls = 0;
-        const result = await probePlan(plan, configured, available, defaultsDir, "strict", true, async (model) => {
+        const result = await probePlan(plan, configured, available, "strict", true, async (model) => {
             calls += 1;
             return { model: `${model.provider}/${model.id}`, provider: model.provider, status: "probe_skipped", latencyMs: 0, checkedAt: Date.now() };
         }, undefined, false);

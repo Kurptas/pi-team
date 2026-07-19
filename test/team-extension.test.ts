@@ -11,6 +11,7 @@ import {
 	safeBlueprintId,
 } from "../src/blueprint-store.ts";
 import { loadModelCapabilityProfiles, profileForModel } from "../src/capabilities.ts";
+import { readCaptainAttentionState, writeCaptainAttentionState } from "../src/captain-attention.ts";
 import {
 	appendTeamMessage,
 	isTeamCancelRequested,
@@ -18,11 +19,13 @@ import {
 	readTeamMailbox,
 	readTeamState,
 	requestTeamCancel,
+	requestWorkerCancel,
 	teamControlPaths,
+	teamMailboxMessageAddressesRole,
 	teamRunLogDir,
 	writeTeamState,
 } from "../src/control.ts";
-import { backgroundNextAction, buildTeamStatusProjection, refreshTeamModelRegistry } from "../src/index.ts";
+import { backgroundNextAction, buildTeamStatusProjection, orderProjectedWorkers, readTeamRunWithControlOverlay, refreshTeamModelRegistry, teamWidgetLines } from "../src/index.ts";
 import { loadTeamResources } from "../src/loader.ts";
 import { modelKey, routeTeamPlan, selectModelForRole } from "../src/model-router.ts";
 import { createTeamPlan, selectPlaybook } from "../src/planner.ts";
@@ -35,6 +38,7 @@ import {
 	determineTeamRunOutcome,
 	finalAssistantText,
 	isRadioReport,
+	radioAcknowledgedRequestIds,
 	roleWithPriorFindings,
 	resolveWorkerTools,
 	workerExitStatus,
@@ -115,17 +119,13 @@ describe("team extension", () => {
 		const resources = loadTeamResources(tempDir, defaultsDir);
 		expect(resources.playbooks.map((playbook) => playbook.id).sort()).toEqual([
 			"code-review",
-			"code-review-2plus1",
-			"continuity-check",
 			"debug-triage",
-			"etf-research",
 			"implementation-review-gate",
-			"multi-angle-cheap-review",
+			"multi-angle-review",
 			"research-roundtable",
 		]);
-		expect(resources.roles.map((role) => role.id)).toContain("bull");
-		expect(resources.roles.map((role) => role.id)).toContain("research-scout");
-		expect(resources.roles.map((role) => role.id)).toContain("fact-checker");
+		expect(resources.roles.map((role) => role.id)).toContain("scout");
+		expect(resources.roles.map((role) => role.id)).toContain("evidence-checker");
 		expect(resources.roles.map((role) => role.id)).toContain("architect-reviewer");
 		expect(resources.roles.map((role) => role.id)).toContain("risk-reviewer");
 		expect(resources.roles.map((role) => role.id)).toContain("implementer");
@@ -133,7 +133,15 @@ describe("team extension", () => {
 		expect(resources.roles.map((role) => role.id)).toContain("log-reader");
 		expect(resources.roles.map((role) => role.id)).toContain("code-path-tracer");
 		expect(resources.roles.map((role) => role.id)).toContain("fix-validator");
-		expect(resources.roles.length).toBeGreaterThanOrEqual(18);
+		expect(resources.roles).toHaveLength(13);
+		expect(resources.roles.every((role) => role.modelPreferences.length === 0)).toBe(true);
+		expect(resources.roles.every((role) => role.capabilityNeeds.length > 0)).toBe(true);
+		expect(resources.roles.find((role) => role.id === "reviewer")?.capabilityNeeds).toEqual([
+			"coding", "long_context", "critical_review",
+		]);
+		const reviewPlan = createTeamPlan({ task: "review", playbook: "code-review" }, resources);
+		expect(reviewPlan.rounds.flatMap((round) => round.roles).find((role) => role.roleId === "reviewer")?.capabilityNeeds)
+			.toEqual(["coding", "long_context", "critical_review"]);
 		const gate = resources.playbooks.find((playbook) => playbook.id === "implementation-review-gate");
 		expect(gate?.rounds.map((round) => `${round.name}:${round.type}:${round.roles.join(",")}`)).toEqual([
 			"implement:chain:implementer",
@@ -150,8 +158,9 @@ describe("team extension", () => {
 		expect(triage?.maxAgents).toBe(3);
 		expect(resources.diagnostics).toEqual([]);
 	});
-	it("loads continuity-check playbook with cross-round role reuse", () => {
-		const resources = loadTeamResources(teamExtensionDir, defaultsDir);
+	it("loads the internal continuity fixture without shipping it as a default", () => {
+		const fixtureDefaults = path.join(repoRoot, "test", "fixtures", "defaults");
+		const resources = loadTeamResources(teamExtensionDir, fixtureDefaults);
 		const cc = resources.playbooks.find((playbook) => playbook.id === "continuity-check");
 		expect(cc).toBeDefined();
 		expect(cc?.rounds.length).toBe(2);
@@ -169,9 +178,9 @@ describe("team extension", () => {
 		expect(indexSource).toContain("model capability facts");
 		expect(indexSource).not.toContain("model capability scores");
 		expect(indexSource).toContain("Captain instruction");
-		expect(plannerSource).toContain("主 Agent 是队长");
-		expect(researchPlaybook).toContain("主 Agent 是本次任务队长");
-		expect(researchPlaybook).toContain("最终建议由队长裁决");
+		expect(plannerSource).toContain("The lead captain owns progress");
+		expect(researchPlaybook).toContain("The captain");
+		expect(researchPlaybook).toContain("owns the final recommendation");
 	});
 	it("loads playbook hints with legacy triggers fallback for captain-visible metadata only", () => {
 		const projectPlaybooks = path.join(tempDir, ".pi/team/playbooks");
@@ -214,6 +223,7 @@ describe("team extension", () => {
 		expect(prompt).toContain("Team radio protocol");
 		expect(prompt).toContain("Report progress to the captain");
 		expect(prompt).toContain("RADIO:");
+		expect(prompt).toContain("ack=<request-id>");
 		expect(prompt).toContain("Do not spawn subagents or start nested team runs");
 		expect(prompt).toContain("keep final output concise");
 	});
@@ -233,22 +243,24 @@ describe("team extension", () => {
 				tools: ["web_search"],
 				systemPrompt: "Read sources",
 				modelPreferences: [],
-				selectedModel: "ai-glm/glm-5.2",
+				selectedModel: "provider-f/model-f",
 			},
 		});
 		expect(prompt).toContain("Worker runtime context");
 		expect(prompt).toContain("Run id: team_test");
 		expect(prompt).toContain("Role id: source-reader");
-		expect(prompt).toContain("Requested/executed model: ai-glm/glm-5.2");
+		expect(prompt).toContain("Requested/executed model: provider-f/model-f");
 		expect(prompt).toContain("Available tools: web_search, fetch_content");
 		expect(prompt).toContain("Mailbox file (human-readable):");
 		expect(prompt).toContain("read` tool");
 	});
 
-	it("distinguishes explicit radio reports from normal assistant output", () => {
+	it("distinguishes explicit radio reports and parses captain request acknowledgments", () => {
 		expect(isRadioReport("RADIO: status=started")).toBe(true);
 		expect(isRadioReport("  RADIO: status=blocked")).toBe(true);
 		expect(isRadioReport("Final answer without radio prefix")).toBe(false);
+		expect(radioAcknowledgedRequestIds("RADIO: ack=req-123; status=received")).toEqual(["req-123"]);
+		expect(radioAcknowledgedRequestIds("RADIO: status=working")).toEqual([]);
 	});
 
 	it("lets project roles override default roles", () => {
@@ -303,15 +315,10 @@ describe("team extension", () => {
 		expect(a1).toBe(a2);
 	});
 
-	it("uses an ETF playbook when the lead explicitly requests it", () => {
+	it("fails visibly when an explicit retired or unknown playbook is requested", () => {
 		const resources = loadTeamResources(tempDir, defaultsDir);
-		const playbook = selectPlaybook({ task: "组队调研 QQQ", playbook: "etf-research" }, resources.playbooks);
-		expect(playbook?.id).toBe("etf-research");
-
-		const plan = createTeamPlan({ task: "组队调研 QQQ", playbook: "etf-research" }, resources);
-		expect(plan.playbook.id).toBe("etf-research");
-		expect(plan.rounds[0]?.type).toBe("parallel");
-		expect(plan.rounds[0]?.roles.map((role) => role.roleId)).toEqual(["bull", "bear", "fact-checker"]);
+		expect(selectPlaybook({ task: "research QQQ", playbook: "etf-research" }, resources.playbooks)).toBeUndefined();
+		expect(() => createTeamPlan({ task: "research QQQ", playbook: "etf-research" }, resources)).toThrow("No team playbook available");
 	});
 
 	it("uses the generic research playbook as a non-semantic fallback", () => {
@@ -320,7 +327,7 @@ describe("team extension", () => {
 		expect(playbook?.id).toBe("research-roundtable");
 		const plan = createTeamPlan({ task: "组队调研任意主题" }, resources);
 		expect(plan.rounds[0]?.roles.map((role) => role.roleId)).toEqual([
-			"research-scout",
+			"scout",
 			"perspective-advocate",
 			"risk-skeptic",
 			"evidence-checker",
@@ -330,10 +337,10 @@ describe("team extension", () => {
 	it("honors explicit playbook selection", () => {
 		const resources = loadTeamResources(tempDir, defaultsDir);
 		const playbook = selectPlaybook(
-			{ task: "调研卓越工程师校企联合培养的制度阻力", playbook: "etf-research" },
+			{ task: "review implementation trade-offs", playbook: "multi-angle-review" },
 			resources.playbooks,
 		);
-		expect(playbook?.id).toBe("etf-research");
+		expect(playbook?.id).toBe("multi-angle-review");
 	});
 
 	it("uses lead-designed roles as a generated roundtable", () => {
@@ -428,7 +435,7 @@ describe("team extension", () => {
 						systemPrompt: "读取官方来源，报告 URL 和访问结果。",
 						tools: ["web_search", "fetch_content", "team"],
 						modelFit: "适合执行稳定、工具调用清楚的模型",
-						modelPreferences: ["ai-glm/glm-5.2"],
+						modelPreferences: ["provider-f/model-f"],
 					},
 					{
 						id: "evidence-synthesizer",
@@ -469,6 +476,7 @@ describe("team extension", () => {
 		expect(blueprint?.roles[0]?.tools).toEqual(["web_search", "fetch_content"]);
 		expect(blueprint?.roles[0]?.capabilityNeeds).toEqual(["research", "tool_use", "speed"]);
 		expect(blueprint?.roles[0]?.modelFit).toContain("工具调用");
+		expect(blueprint?.roles[0]?.modelPreferences).toEqual([]);
 		expect(blueprint?.rounds.map((round) => round.id)).toEqual(["collect-official-sources", "synthesize-evidence"]);
 		expect(blueprint?.evidencePolicy).toContain("URL");
 	});
@@ -590,15 +598,15 @@ describe("team extension", () => {
 				status: "succeeded",
 				output: longOutput,
 				lastOutputPreview: "short factual preview",
-				model: "deepseek/deepseek-v4-pro",
-				routingReason: "policy=task_first; selected via recommendation; captain remains final judge",
-				modelFallbackKeys: ["deepseek/deepseek-v4-flash"],
+				model: "provider-b/model-b-pro",
+				routingReason: "policy=task_first; selected via metadata; captain remains final judge",
+				modelFallbackKeys: ["provider-b/model-b"],
 				outputFile: "/artifacts/reviewer.md",
 			},
 		], { status: "succeeded", warnings: [] });
 		expect(summary).toContain("Worker evidence digest");
 		expect(summary).toContain("Route: policy=task_first");
-		expect(summary).toContain("Fallbacks: deepseek/deepseek-v4-flash");
+		expect(summary).toContain("Fallbacks: provider-b/model-b");
 		expect(summary).toContain("Artifact: /artifacts/reviewer.md");
 		expect(summary).toContain("Summary: short factual preview");
 		expect(summary).not.toContain(longOutput);
@@ -857,15 +865,66 @@ describe("team extension", () => {
 		expect(typeof result.command).toBe("string");
 	});
 
-	it("writes captain mailbox messages and cancel requests for active team runs", async () => {
-		await appendTeamMessage(tempDir, "team_test", "请先核查官方来源。");
+	it("writes request-addressable captain mailbox messages and cancel requests for active team runs", async () => {
+		const written = await appendTeamMessage(tempDir, "team_test", "请先核查官方来源。");
 		const messages = await readTeamMailbox(tempDir, "team_test");
 		expect(messages).toHaveLength(1);
 		expect(messages[0]?.message).toBe("请先核查官方来源。");
+		expect(messages[0]?.messageRef).toBe(written.requestId);
+		const mirror = fs.readFileSync(teamControlPaths(tempDir, "team_test").mailboxTextFile, "utf-8");
+		expect(mirror).toContain(`request=${written.requestId}`);
 		expect(await listTeamRunIds(tempDir)).toContain("team_test");
 		expect(isTeamCancelRequested(tempDir, "team_test")).toBe(false);
 		await requestTeamCancel(tempDir, "team_test", "队长取消");
 		expect(isTeamCancelRequested(tempDir, "team_test")).toBe(true);
+	});
+
+	it("writes targeted requests without creating broadcast ACK debt", async () => {
+		const written = await appendTeamMessage(tempDir, "team_target", "focus now", { targetRoleId: "reviewer-a" });
+		const messages = await readTeamMailbox(tempDir, "team_target");
+		expect(messages[0]).toMatchObject({
+			messageRef: written.requestId, targetRoleId: "reviewer-a", broadcast: false,
+		});
+		expect(teamMailboxMessageAddressesRole(messages[0]!, "reviewer-a")).toBe(true);
+		expect(teamMailboxMessageAddressesRole(messages[0]!, "reviewer-b")).toBe(false);
+		const mirror = fs.readFileSync(teamControlPaths(tempDir, "team_target").mailboxTextFile, "utf-8");
+		expect(mirror).toContain("target=reviewer-a");
+	});
+
+	it("team_message targets one active worker without creating debt for peers", async () => {
+		const extension = registerTeamExtension();
+		await writeTeamState(tempDir, {
+			runId: "team_target_tool", task: "target", playbookId: "generated-blueprint", status: "running",
+			modelHealth: [], events: [], workers: [
+				{ roleId: "a", title: "A", task: "a", status: "running", output: "", startedAt: 1 },
+				{ roleId: "b", title: "B", task: "b", status: "running", output: "", startedAt: 1 },
+			],
+		});
+		const response = await extension.tools.get("team_message")!.execute(
+			"message-target", { runId: "team_target_tool", roleId: "a", message: "focus" }, undefined, undefined, { cwd: tempDir } as any,
+		);
+		expect(response.isError).not.toBe(true);
+		const messages = await readTeamMailbox(tempDir, "team_target_tool");
+		expect(messages[0]).toMatchObject({ targetRoleId: "a", broadcast: false });
+		const overlaid = await readTeamRunWithControlOverlay(tempDir, "team_target_tool");
+		expect(overlaid?.workers[0]).toMatchObject({ lastCaptainMessageRef: messages[0]!.messageRef });
+		expect(overlaid?.workers[1]?.lastCaptainMessageRef).toBeUndefined();
+		await extension.handlers.get("session_shutdown")![0]({});
+	});
+
+	it("projects a persisted worker cancel request before the worker observes it", async () => {
+		await writeTeamState(tempDir, {
+			runId: "team_cancel_overlay", task: "cancel", playbookId: "generated-blueprint", status: "running",
+			modelHealth: [], events: [], workers: [
+				{ roleId: "a", title: "A", task: "a", status: "running", output: "", startedAt: 1 },
+			],
+		});
+		await requestWorkerCancel(tempDir, "team_cancel_overlay", "a", "stop");
+		const overlaid = await readTeamRunWithControlOverlay(tempDir, "team_cancel_overlay");
+		expect(overlaid?.workers[0]?.cancelRequestedAt).toEqual(expect.any(Number));
+		expect(overlaid?.workers[0]?.cancelObservedAt).toBeUndefined();
+		const projection = buildTeamStatusProjection(overlaid!, [], Date.now() + 120_000);
+		expect(projection.workers[0]).toMatchObject({ attentionDebt: true });
 	});
 
 	it("keeps system mailbox notices out of the worker-visible mirror", async () => {
@@ -921,9 +980,9 @@ describe("team extension", () => {
 
 	it("routes roles only to models that passed live probe", () => {
 		const resources = loadTeamResources(tempDir, defaultsDir);
-		const plan = createTeamPlan({ task: "组队调研 QQQ", playbook: "etf-research" }, resources);
-		const gpt = testModel("0u0o-codex", "gpt-5.5", true);
-		const glm = testModel("ai-glm", "glm-5.2", true);
+		const plan = createTeamPlan({ task: "research QQQ", playbook: "research-roundtable" }, resources);
+		const gpt = testModel("provider-e", "model-e", true);
+		const glm = testModel("provider-f", "model-f", true);
 		const health: ModelHealthSnapshot[] = [
 			passed(gpt),
 			{
@@ -938,22 +997,37 @@ describe("team extension", () => {
 
 		const routed = routeTeamPlan(plan, [gpt, glm], health);
 		const firstRole = routed.rounds[0]?.roles[0];
-		expect(firstRole?.selectedModel).toBe("0u0o-codex/gpt-5.5");
+		expect(firstRole?.selectedModel).toBe("provider-e/model-e");
 		expect(firstRole?.fallbackReason).toBeUndefined();
 	});
 
-	it("loads model-family capability profiles for different providers", () => {
-		const profiles = loadModelCapabilityProfiles(defaultsDir);
-		const gpt = profileForModel("openai/gpt-5", "gpt-5", profiles);
-		const channelGpt = profileForModel("0u0o-codex/gpt-5.5", "gpt-5.5", profiles);
-		expect(gpt?.family).toBe("gpt-5-family");
-		expect(channelGpt?.family).toBe("gpt-5-family");
-		expect(gpt?.strengths).toContain("agentic coding");
+	it("loads concrete capability profiles only from user or project configuration", () => {
+		expect(fs.existsSync(path.join(defaultsDir, "model-capabilities.json"))).toBe(false);
+		const configDir = path.join(tempDir, ".pi", "team");
+		fs.mkdirSync(configDir, { recursive: true });
+		fs.writeFileSync(path.join(configDir, "model-capabilities.json"), JSON.stringify({ profiles: [{
+			family: "local-review-family",
+			models: ["provider-a/model-a"],
+			aliases: ["model-a"],
+			capabilities: ["coding", "critical_review"],
+			strengths: ["project verified review behavior"],
+		}] }));
+		const profiles = loadModelCapabilityProfiles(tempDir);
+		const profile = profileForModel("provider-a/model-a", "model-a", profiles);
+		expect(profile).toMatchObject({
+			family: "local-review-family", capabilities: ["coding", "critical_review"],
+		});
 	});
 
-	it("uses capability profiles as routing evidence without replacing lead preference", () => {
-		const gpt = testModel("0u0o-codex", "gpt-5.5", true);
-		const glm = testModel("ai-glm", "glm-5.2", true);
+	it("uses local capability profiles as evidence without replacing captain preference", () => {
+		const preferred = testModel("provider-a", "model-a", true);
+		const alternative = testModel("provider-b", "model-b", true);
+		const configDir = path.join(tempDir, ".pi", "team");
+		fs.mkdirSync(configDir, { recursive: true });
+		fs.writeFileSync(path.join(configDir, "model-capabilities.json"), JSON.stringify({ profiles: [{
+			family: "local-research-family", models: ["provider-a/model-a"], aliases: [],
+			capabilities: ["research", "tool_use"], strengths: ["locally verified research"],
+		}] }));
 		const role: PlannedRole = {
 			roleId: "source-reader",
 			title: "Source reader",
@@ -962,10 +1036,10 @@ describe("team extension", () => {
 			task: "Read sources",
 			tools: ["web_search"],
 			systemPrompt: "Read sources",
-			modelPreferences: ["0u0o-codex/gpt-5.5"],
+			modelPreferences: ["provider-a/model-a"],
 		};
-		const routed = selectModelForRole(role, [gpt, glm], [passed(gpt), passed(glm)], new Set());
-		expect(routed.model?.provider).toBe("0u0o-codex");
+		const routed = selectModelForRole(role, [preferred, alternative], [passed(preferred), passed(alternative)], new Set());
+		expect(routed.model?.provider).toBe("provider-a");
 		const plan = routeTeamPlan(
 			{
 				objective: "research",
@@ -994,17 +1068,17 @@ describe("team extension", () => {
 				},
 				synthesis: { task: "s", requiredSections: [] },
 			},
-			[gpt, glm],
-			[passed(gpt), passed(glm)],
-			loadModelCapabilityProfiles(defaultsDir),
+			[preferred, alternative],
+			[passed(preferred), passed(alternative)],
+			loadModelCapabilityProfiles(tempDir),
 		);
-		expect(routed.model?.id).toBe("gpt-5.5");
-		expect(plan.rounds[0]?.roles[0]?.routingReason).toContain("lead preference 0u0o-codex/gpt-5.5");
+		expect(routed.model?.id).toBe("model-a");
+		expect(plan.rounds[0]?.roles[0]?.routingReason).toContain("lead preference provider-a/model-a");
 		expect(plan.rounds[0]?.roles[0]?.routingReason).toContain("lead remains final judge");
 	});
 
 	it("keeps timeout probes as lead-observed status without blocking dispatch", () => {
-		const model = testModel("openai", "gpt-5", true);
+		const model = testModel("provider-x", "model-x", true);
 		const role = {
 			roleId: "reviewer",
 			title: "Reviewer",
@@ -1013,15 +1087,15 @@ describe("team extension", () => {
 			task: "Review",
 			tools: ["read"],
 			systemPrompt: "Review",
-			modelPreferences: ["openai/gpt-5"],
+			modelPreferences: ["provider-x/model-x"],
 		};
 		const result = selectModelForRole(
 			role,
 			[model],
 			[
 				{
-					model: "openai/gpt-5",
-					provider: "openai",
+					model: "provider-x/model-x",
+					provider: "provider-x",
 					status: "timeout",
 					latencyMs: 20_000,
 					checkedAt: 1,
@@ -1034,8 +1108,8 @@ describe("team extension", () => {
 	});
 
 	it("uses availability facts to skip objectively unavailable preferred models", () => {
-		const gpt = testModel("0u0o-codex", "gpt-5.5", true);
-		const glm = testModel("ai-glm", "glm-5.2", true);
+		const gpt = testModel("provider-e", "model-e", true);
+		const glm = testModel("provider-f", "model-f", true);
 		const role: PlannedRole = {
 			roleId: "researcher",
 			title: "Researcher",
@@ -1044,15 +1118,15 @@ describe("team extension", () => {
 			task: "Research",
 			tools: ["web_search"],
 			systemPrompt: "Research",
-			modelPreferences: ["0u0o-codex/gpt-5.5"],
+			modelPreferences: ["provider-e/model-e"],
 		};
 		const result = selectModelForRole(
 			role,
 			[gpt, glm],
 			[
 				{
-					model: "0u0o-codex/gpt-5.5",
-					provider: "0u0o-codex",
+					model: "provider-e/model-e",
+					provider: "provider-e",
 					status: "missing_auth",
 					latencyMs: 10,
 					checkedAt: 1,
@@ -1061,12 +1135,12 @@ describe("team extension", () => {
 			],
 			new Set(),
 		);
-		expect(result.model?.provider).toBe("ai-glm");
+		expect(result.model?.provider).toBe("provider-f");
 		expect(result.fallbackReason).toContain("preferred models unavailable");
 	});
 
 	it("avoids objectively unavailable models", () => {
-		const model = testModel("openai", "gpt-5", true);
+		const model = testModel("provider-x", "model-x", true);
 		const role = {
 			roleId: "reviewer",
 			title: "Reviewer",
@@ -1075,15 +1149,15 @@ describe("team extension", () => {
 			task: "Review",
 			tools: ["read"],
 			systemPrompt: "Review",
-			modelPreferences: ["openai/gpt-5"],
+			modelPreferences: ["provider-x/model-x"],
 		};
 		const result = selectModelForRole(
 			role,
 			[model],
 			[
 				{
-					model: "openai/gpt-5",
-					provider: "openai",
+					model: "provider-x/model-x",
+					provider: "provider-x",
 					status: "missing_auth",
 					latencyMs: 10,
 					checkedAt: 1,
@@ -1105,6 +1179,8 @@ describe("team extension", () => {
 		expect(result.tools.has("team_cancel")).toBe(true);
 		expect(result.tools.has("team_promote_blueprint")).toBe(true);
 		expect(result.tools.has("team_cancel_worker")).toBe(true);
+		expect(result.handlers.get("agent_start")).toHaveLength(1);
+		expect(result.handlers.get("agent_end")).toHaveLength(1);
 	});
 
 	it("clears queued state write errors after a later successful write", async () => {
@@ -1158,6 +1234,11 @@ describe("team extension", () => {
 						output: "",
 						startedAt: 1_000,
 						lastSignalAt: 1_000,
+						lastReportAt: 5_000,
+						lastCaptainMessageAt: 9_000,
+						lastCaptainMessageRef: "req-status",
+						lastCaptainDeliveredAt: 10_000,
+						lastCaptainDeliveredRef: "req-status",
 						lastEvent: "worker-start",
 						outputKind: "empty",
 						tools: ["read"],
@@ -1195,13 +1276,59 @@ describe("team extension", () => {
 		);
 
 		expect(projection.counts).toMatchObject({ total: 2, active: 1, succeeded: 1, stale: 1, parseErrors: 2, toolViolations: 1, toolCalls: 1, toolErrors: 1, requests: 3, tokens: 150, costUsd: 0.03 });
-		expect(projection.workers[0]?.activeTools).toEqual(["read"]);
+		expect(projection.workers[0]).toMatchObject({
+			activeTools: ["read"], communicationAgeSeconds: 25,
+			pendingAckRef: "req-status", pendingAckAgeSeconds: 20,
+		});
+		expect(projection.ackGroups).toEqual([expect.objectContaining({
+			requestRef: "req-status", total: 1, delivered: 1, acked: 0,
+			pendingAckRoleIds: ["slow"], pendingDeliveryRoleIds: [],
+		})]);
 		expect(projection.workers[1]).toMatchObject({ toolCallCount: 1, toolErrorCount: 1 });
 		expect(projection.workers[1]?.toolIsolationViolation).toContain("bash");
 		expect(projection.modelHealth[0]?.evidenceSource).toBe("probe");
 		expect(projection.mailbox.lastMessagePreview).toBe("check source");
 		expect(projection.evidenceWarnings).toEqual(["1 worker(s) had malformed event stream lines"]);
 		expect(projection.controls).toEqual(["team_message", "team_cancel_worker", "team_spawn_worker", "team_cancel"]);
+	});
+
+	it("aggregates broadcast request delivery and ACK state across workers", () => {
+		const makeWorker = (roleId: string, delivered: boolean, acked: boolean): WorkerRun => ({
+			roleId, title: roleId, task: roleId, status: "running", output: "", startedAt: 0,
+			lastCaptainMessageAt: 1_000, lastCaptainMessageRef: "req-broadcast",
+			lastCaptainDeliveredAt: delivered ? 2_000 : undefined,
+			lastCaptainDeliveredRef: delivered ? "req-broadcast" : undefined,
+			lastCaptainAckAt: acked ? 3_000 : undefined,
+			lastCaptainAckRef: acked ? "req-broadcast" : undefined,
+		});
+		const completedAck = { ...makeWorker("d", true, true), status: "succeeded" as const, output: "done", endedAt: 4_000 };
+		const pendingDelivery = { ...makeWorker("e", false, false), status: "pending" as const };
+		const run: TeamRun = {
+			runId: "team_ack_group", task: "observe", playbookId: "generated-blueprint", status: "running",
+			modelHealth: [], workers: [makeWorker("a", true, true), makeWorker("b", true, false), makeWorker("c", false, false), completedAck, pendingDelivery],
+		};
+		expect(buildTeamStatusProjection(run, [], 5_000).ackGroups).toEqual([{
+			requestRef: "req-broadcast", total: 5, delivered: 3, acked: 2,
+			deliveredRoleIds: ["a", "b", "d"], ackedRoleIds: ["a", "d"],
+			pendingDeliveryRoleIds: ["c", "e"], pendingAckRoleIds: ["b"], terminalWithoutAckRoleIds: [],
+		}]);
+	});
+
+	it("projects communication and request ages from the captain re-arm anchor", () => {
+		const run: TeamRun = {
+			runId: "team_rearm_projection", task: "observe", playbookId: "generated-blueprint", status: "running",
+			modelHealth: [], workers: [{
+				roleId: "a", title: "A", task: "a", status: "running", output: "", startedAt: 0,
+				lastReportAt: 0, lastCaptainMessageAt: 0, lastCaptainMessageRef: "req-a",
+				lastCaptainDeliveredAt: 0, lastCaptainDeliveredRef: "req-a",
+			}], attentionState: { roles: {
+				a: { communicationAt: 0, silenceAlerted: false, pendingRequestRef: "req-a", pendingAckAlerted: false, cancelAlerted: false, rearmAt: 25_000 },
+			} },
+		};
+		const projection = buildTeamStatusProjection(run, [], 30_000);
+		expect(projection.workers[0]).toMatchObject({
+			communicationAgeSeconds: 5, pendingAckAgeSeconds: 5, attentionDebt: false, rearmAt: 25_000,
+		});
 	});
 
 	it("projects controls for every run phase without treating synthesis as terminal", () => {
@@ -1252,7 +1379,7 @@ describe("team extension", () => {
 					roleId: "researcher",
 					title: "Researcher",
 					task: "find facts",
-					model: "provider/claude-sonnet",
+					model: "provider/model-y",
 					status: "running",
 					output: "",
 					startedAt: 1_000,
@@ -1263,7 +1390,7 @@ describe("team extension", () => {
 					roleId: "reviewer",
 					title: "Reviewer",
 					task: "check facts",
-					model: "provider/deepseek",
+					model: "provider/provider-b",
 					status: "succeeded",
 					output: "ok",
 					startedAt: 1_000,
@@ -1291,6 +1418,58 @@ describe("team extension", () => {
 		).render(80);
 		expect(expanded.join("\n")).toContain("Researcher");
 		expect(expanded.join("\n")).toContain("Reviewer");
+	});
+
+	it("shows progressing and pending workers before every terminal worker", () => {
+		const makeWorker = (roleId: string, status: WorkerRun["status"]): WorkerRun => ({
+			roleId, title: roleId, task: roleId, status, output: status === "running" || status === "pending" ? "" : "done", startedAt: 1,
+		});
+		const run: TeamRun = {
+			runId: "team_progress_first", task: "observe", playbookId: "generated-blueprint", status: "running", modelHealth: [],
+			workers: [makeWorker("failed-source", "failed"), makeWorker("done-source", "succeeded"), makeWorker("running", "running"), makeWorker("pending", "pending")],
+		};
+		const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as any;
+		const lines = teamWidgetLines(run, theme);
+		const expectedOrder = ["running", "pending", "failed-source", "done-source"];
+		expect(lines[0]).toContain("custom-plan");
+		expect(lines[0]).not.toContain("generated-blueprint");
+		expect(lines.slice(1).map((line) => expectedOrder.find((id) => line.includes(id)))).toEqual(expectedOrder);
+		expect(orderProjectedWorkers(buildTeamStatusProjection(run, []).workers).map((worker) => worker.roleId)).toEqual(expectedOrder);
+	});
+
+	it("distinguishes degraded workers from pending and counts them in compact TUI", () => {
+		const run: TeamRun = {
+			runId: "team_degraded_glyph", task: "x", playbookId: "p", status: "degraded", modelHealth: [],
+			workers: [{ roleId: "partial", title: "partial", task: "x", status: "degraded", output: "partial evidence" }],
+		};
+		const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as any;
+		const lines = teamWidgetLines(run, theme);
+		expect(lines[0]).toContain("◐ 1 degraded");
+		expect(lines[1]).toContain("◐");
+	});
+
+	it("labels delivered but unacknowledged requests as awaiting ACK", () => {
+		const run: TeamRun = {
+			runId: "team_awaiting_ack", task: "x", playbookId: "p", status: "running", modelHealth: [],
+			workers: [{
+				roleId: "reviewer", title: "reviewer", task: "x", status: "running", output: "", startedAt: 1,
+				lastCaptainMessageRef: "req-1", lastCaptainMessageAt: 2, lastCaptainDeliveredRef: "req-1", lastCaptainDeliveredAt: 3,
+			}],
+		};
+		const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as any;
+		const line = teamWidgetLines(run, theme)[1];
+		expect(line).toContain("AWAITING_ACK:req-1");
+		expect(line).not.toContain(" ACK:req-1");
+	});
+
+	it("names hidden pending workers in compact TUI overflow", () => {
+		const workers: WorkerRun[] = ["a", "b", "c", "d"].map((roleId) => ({
+			roleId, title: roleId, task: roleId, status: "running", output: "", startedAt: 1,
+		}));
+		workers.push({ roleId: "pending-e", title: "pending-e", task: "e", status: "pending", output: "" });
+		const run: TeamRun = { runId: "team_pending_overflow", task: "x", playbookId: "p", status: "running", modelHealth: [], workers };
+		const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as any;
+		expect(teamWidgetLines(run, theme).at(-1)).toContain("1 pending: pending-e");
 	});
 
 	it("cleans session-scoped team widget and status on shutdown", async () => {
@@ -1331,10 +1510,39 @@ describe("team extension", () => {
 		const content = status.content[0];
 		expect(content?.type).toBe("text");
 		if (content?.type !== "text") throw new Error("expected text content");
-		expect(content.text).toContain("state write: failed to write team state: disk full");
+		expect(content.text).toContain("state write error: failed to write team state: disk full");
+		expect(content.text).toContain("plan: custom-plan (task-specific roles)");
+		expect(content.text).not.toContain("fallback policy: task_first");
+		expect(content.text).not.toContain("mailbox text:");
 		expect(content.text).toContain("workers: total:0 active:0 succeeded:0 failed:0 degraded:0 skipped:0 stale:0");
 		expect((status.details as TeamRun).stateWriteError).toBe("failed to write team state: disk full");
 		expect((status.details as any).statusProjection.stateWriteError).toBe("failed to write team state: disk full");
+	});
+
+	it("keeps default team_status focused on control evidence", async () => {
+		const result = registerTeamExtension();
+		const teamStatus = result.tools.get("team_status");
+		await writeTeamState(tempDir, {
+			runId: "team_short_status", task: "observe", playbookId: "generated-blueprint", status: "degraded", modelHealth: [], events: [],
+			workers: [{
+				roleId: "reviewer", title: "Reviewer", task: "review", status: "degraded", model: "provider/model",
+				output: "partial evidence", outputKind: "radio_only", errorReason: "budget ended the worker",
+				startedAt: 1, endedAt: 2_001, requests: 4, tokens: 900, tools: ["read", "bash"], activeTools: ["read"],
+				laneId: "lane-internal", delegationToken: "secret-internal", events: [{ phase: "tool", message: "tool_execution_start" }],
+			}],
+		});
+		const status = await teamStatus!.execute("short", { runId: "team_short_status" }, undefined, undefined, { cwd: tempDir } as any);
+		const text = status.content[0]?.text ?? "";
+		expect(text).toContain("degraded [reviewer] Reviewer provider/model elapsed:2s ended");
+		expect(text).toContain("output:radio_only");
+		expect(text).not.toContain("preview:partial evidence");
+		expect(text).toContain("error:budget ended the worker");
+		expect(text).not.toContain("toolCalls:");
+		expect(text).not.toContain("events:");
+		expect(text).not.toContain(" activeTools:");
+		expect(text).not.toContain(" lane:");
+		expect(text).not.toContain(" req:");
+		expect(text).not.toContain(" tok:");
 	});
 
 	it("self-heals a stuck status line when team_status observes a terminal run", async () => {
@@ -1367,6 +1575,33 @@ describe("team extension", () => {
 		// Terminal observation must clear both the per-run widget and status keys.
 		expect(calls).toContainEqual(["widget", "pi-team-workers:team_terminal_heal", undefined]);
 		expect(calls).toContainEqual(["status", "pi-team-status:team_terminal_heal", undefined]);
+	});
+
+	it("renders pre-observation attention evidence before rearming the next window", async () => {
+		const result = registerTeamExtension();
+		const teamStatus = result.tools.get("team_status");
+		const now = Date.now();
+		const cancelRequestedAt = now - 130_000;
+		await writeTeamState(tempDir, {
+			runId: "team_pre_rearm", task: "observe", playbookId: "generated-blueprint", status: "running", modelHealth: [], events: [],
+			workers: [{
+				roleId: "reviewer", title: "Reviewer", task: "review", status: "running", output: "", model: "provider/model",
+				startedAt: now - 140_000, lastReportAt: now - 130_000, lastSignalAt: now, cancelRequestedAt,
+				requests: 2, tokens: 100, costUsd: 0.25, lastTool: "read", activeTools: ["read"], tools: ["read"],
+			}],
+		});
+		const attentionFile = teamControlPaths(tempDir, "team_pre_rearm").attentionFile;
+		await writeCaptainAttentionState(attentionFile, { roles: {
+			reviewer: { communicationAt: now - 130_000, silenceAlerted: false, pendingAckAlerted: false, pendingCancelAt: cancelRequestedAt, cancelAlerted: true },
+		} });
+		const status = await teamStatus!.execute("pre-rearm", { runId: "team_pre_rearm" }, undefined, undefined, { cwd: tempDir } as any);
+		const text = status.content[0]?.text ?? "";
+		expect(text).toContain("attention:1");
+		expect(text).toMatch(/cancel:requested\/13\ds/);
+		expect(text).toContain("tool:read req:2 tok:100 cost:$0.2500");
+		const rearmed = await readCaptainAttentionState(attentionFile);
+		expect(rearmed?.roles.reviewer?.cancelAlerted).toBe(false);
+		expect(rearmed?.roles.reviewer?.rearmAt).toBeDefined();
 	});
 
 	it("does not touch the UI when team_status observes a running run", async () => {

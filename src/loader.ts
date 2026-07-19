@@ -3,7 +3,8 @@ import * as path from "node:path";
 import * as piCodingAgent from "@earendil-works/pi-coding-agent";
 import { isThinkingLevel } from "./model-selector.ts";
 import { CONFIG_DIR_NAME, getAgentDir } from "./runtime-compat.ts";
-import type { FanoutOnEmpty, FanoutRoundConfig, Playbook, PlaybookRound, ResourceSource, RoleSpec, TeamMode, TeamResources } from "./types.ts";
+import { isModelCapabilityDimension } from "./types.ts";
+import type { FanoutOnEmpty, FanoutRoundConfig, ModelCapabilityDimension, Playbook, PlaybookRound, ResourceSource, RoleSpec, TeamMode, TeamResources } from "./types.ts";
 const parseFrontmatter = piCodingAgent.parseFrontmatter;
 
 interface PlaybookFrontmatter extends Record<string, unknown> {
@@ -23,6 +24,7 @@ interface RoleFrontmatter extends Record<string, unknown> {
     title?: string;
     description?: string;
     tools?: unknown;
+    capability_needs?: unknown;
     model_preferences?: unknown;
     thinking?: string;
     thinking_level?: string;
@@ -184,12 +186,22 @@ function loadRole(filePath: string, source: ResourceSource, diagnostics: string[
         if (thinking !== undefined && !isThinkingLevel(thinking)) {
             diagnostics.push(`Ignored invalid thinking level for role ${frontmatter.id}: ${thinking}`);
         }
+        const rawCapabilities = stringList(frontmatter.capability_needs);
+        const capabilityNeeds = rawCapabilities.filter((item): item is ModelCapabilityDimension => isModelCapabilityDimension(item));
+        for (const invalid of rawCapabilities.filter((item) => !isModelCapabilityDimension(item))) {
+            diagnostics.push(`Ignored invalid capability need for role ${frontmatter.id}: ${invalid}`);
+        }
+        const declaredPreferences = stringList(frontmatter.model_preferences);
+        if (source === "default" && declaredPreferences.length > 0) {
+            diagnostics.push(`Ignored model_preferences in built-in role ${frontmatter.id}; built-ins must be model-neutral`);
+        }
         return {
             id: frontmatter.id,
             title: frontmatter.title,
             description: frontmatter.description,
             tools: stringList(frontmatter.tools),
-            modelPreferences: stringList(frontmatter.model_preferences),
+            capabilityNeeds,
+            modelPreferences: source === "default" ? [] : declaredPreferences,
             thinkingLevel: isThinkingLevel(thinking) ? thinking : undefined,
             outputSchema: frontmatter.output_schema ?? "worker_finding",
             body,
