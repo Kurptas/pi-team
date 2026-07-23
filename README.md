@@ -29,7 +29,7 @@ pi install npm:pi-team
 **Pin a specific version**
 
 ```bash
-pi install npm:pi-team@0.6.10
+pi install npm:pi-team@0.6.11
 ```
 
 Then run `/reload` in Pi to activate it.
@@ -45,7 +45,7 @@ omp install pi-team
 **Pin a specific version**
 
 ```bash
-omp install pi-team@0.6.10
+omp install pi-team@0.6.11
 ```
 
 Then restart or reload Oh My Pi.
@@ -83,7 +83,7 @@ In practice: ask *one* model to review a pull request and it clears the change �
 
 ## You stay in the loop
 
-A team only helps if you can see it work and step in when it drifts. Background runs are push-first: Pi tells you when the team finishes or when a worker has gone two minutes without effective RADIO/ACK communication, instead of making you poll. Each episode alerts once; inspecting or steering an alerted worker opens one new observation window. Multiple worker debts are grouped, unfinished workers stay ahead of terminal ones in the TUI, and targeted or broadcast captain requests are actively delivered with queued/delivered/ACK state. Notifications never cancel or reroute workers for you—the judgment stays yours.
+A team only helps if you can see it work and step in when it drifts. Background runs are push-first: Pi tells you when the team finishes or when a worker has gone two minutes without effective RADIO/ACK communication, instead of making you poll. Each episode alerts once; inspecting or steering an alerted worker opens one new observation window. Multiple worker debts are grouped, unfinished workers stay ahead of terminal ones in the TUI, and targeted or broadcast captain requests are actively delivered with queued/delivered/ACK state. When a worker model fails, pi-team prefers the same model ID through another configured provider or channel before moving to a different model. Notifications never cancel or reroute workers for you—the judgment stays yours.
 
 ## Going further
 

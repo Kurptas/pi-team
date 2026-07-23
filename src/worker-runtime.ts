@@ -81,18 +81,28 @@ export function classifyBudgetState(
     };
 }
 
+/** Return the model id portion of a `provider/model-id` key. */
+function modelIdFromKey(key: string): string {
+    const separator = key.indexOf("/");
+    return separator >= 0 ? key.slice(separator + 1) : key;
+}
+
 /**
- * Pure next-model selection for the fallback retry loop. Given the models
- * already attempted and the role's ordered fallback keys, return the first
- * untried fallback, or undefined when none remain. The actual decision to retry
- * combines this with shouldRetryWorker(result); kept pure so the
- * provider-failure fallback path is unit-testable without spawning workers.
+ * Pure next-model selection for the fallback retry loop. The first attempted
+ * model defines the requested model identity. Untried fallbacks with the same
+ * model id (another provider/channel) are preferred; after those channels are
+ * exhausted, the original fallback order is preserved.
  */
 export function selectRetryModel(
     attemptedModels: Array<string | undefined>,
     fallbackKeys: string[] | undefined,
 ): string | undefined {
     if (!fallbackKeys || fallbackKeys.length === 0) return undefined;
-    const tried = new Set(attemptedModels.filter((model): model is string => Boolean(model)));
-    return fallbackKeys.find((model) => !tried.has(model));
+    const attempted = attemptedModels.filter((model): model is string => Boolean(model));
+    const tried = new Set(attempted);
+    const untried = fallbackKeys.filter((model) => !tried.has(model));
+    const requestedModelId = attempted[0] ? modelIdFromKey(attempted[0]) : undefined;
+    return (requestedModelId
+        ? untried.find((model) => modelIdFromKey(model) === requestedModelId)
+        : undefined) ?? untried[0];
 }

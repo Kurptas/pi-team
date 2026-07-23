@@ -573,6 +573,17 @@ describe("reliability helpers", () => {
         expect(resolved.rolePlans[0]!.fallbackModels).toHaveLength(2);
     });
 
+    it("reserves fallback slots for the same model id through another channel", () => {
+        const configured: ConfiguredModel[] = [
+            { key: "channel-a/model-x", provider: "channel-a", id: "model-x", name: "Model X" },
+            { key: "provider-other/model-y", provider: "provider-other", id: "model-y", name: "Model Y" },
+            { key: "channel-b/model-x", provider: "channel-b", id: "model-x", name: "Model X" },
+        ];
+        const probeSet = selectModelsToProbe([modelRole(["channel-a/model-x"])], configured, "task_first");
+        expect(probeSet.rolePlans![0]!.candidates.map((candidate) => candidate.key))
+            .toEqual(["channel-a/model-x", "channel-b/model-x", "provider-other/model-y"]);
+    });
+
     it("treats explicit multi-round role preferences as direct model dispatch", () => {
         expect(shouldDirectModelDispatch({
             task: "two rounds",
@@ -756,19 +767,21 @@ describe("reliability helpers", () => {
         expect(classifyBudgetState(30, budget, { budgetNoticeSent: true, budgetExceeded: true })).toEqual({ reachedSoft: false, reachedHard: false });
     });
 
-    it("selects the first untried fallback model for provider-failure retry", () => {
+    it("selects the first untried fallback when no same-model channel exists", () => {
         const fallbacks = ["provider-b/model-b", "provider-b/model-b-pro", "provider-d/model-d"];
-        // nothing tried yet → first fallback
         expect(selectRetryModel([], fallbacks)).toBe("provider-b/model-b");
-        // first already attempted → next untried
         expect(selectRetryModel(["provider-b/model-b"], fallbacks)).toBe("provider-b/model-b-pro");
-        // skips undefined attempts and respects order
         expect(selectRetryModel([undefined, "provider-b/model-b", "provider-b/model-b-pro"], fallbacks)).toBe("provider-d/model-d");
-        // all exhausted → undefined (loop terminates, no infinite retry)
         expect(selectRetryModel(fallbacks, fallbacks)).toBeUndefined();
-        // no fallback keys → undefined
         expect(selectRetryModel(["x"], undefined)).toBeUndefined();
         expect(selectRetryModel([], [])).toBeUndefined();
+    });
+
+    it("prioritizes the same model id through another provider channel", () => {
+        const fallbacks = ["provider-b/model-b", "channel-b/model-x", "provider-d/model-d"];
+        expect(selectRetryModel(["channel-a/model-x"], fallbacks)).toBe("channel-b/model-x");
+        // Once all channels for model-x are exhausted, preserve the original fallback order.
+        expect(selectRetryModel(["channel-a/model-x", "channel-b/model-x"], fallbacks)).toBe("provider-b/model-b");
     });
 
     it("keeps an explicit primary selected after a soft probe timeout", () => {

@@ -193,15 +193,34 @@ export function selectModelsToProbe(
                     || (providerUse.get(a.model.provider) ?? 0) - (providerUse.get(b.model.provider) ?? 0)
                     || a.index - b.index,
                 );
-            for (const [index, rankedModel] of ranked.entries()) {
-                if (candidates.length >= 3) break;
+            const addRankedCandidate = (rankedModel: (typeof ranked)[number]): void => {
+                if (candidates.length >= 3 || added.has(rankedModel.model.key)) return;
                 candidates.push({
                     key: rankedModel.model.key,
-                    source: index === 0 && role.modelPreferences.length === 0 ? "metadata" : "fallback",
+                    source: candidates.length === 0 && role.modelPreferences.length === 0 ? "metadata" : "fallback",
                     thinkingLevel: effectiveThinkingLevel(role),
                     matchReason: `${fallbackPolicy === "cheap_only" ? "runtime-cost pool" : "runtime metadata"}; score=${rankedModel.score.toFixed(2)}; ${rankedModel.reason}`,
                 });
                 added.add(rankedModel.model.key);
+            };
+
+            // Establish the primary first, then reserve remaining candidate
+            // slots for the same model id through other providers/channels.
+            if (candidates.length === 0 && ranked[0]) addRankedCandidate(ranked[0]);
+            const primaryModel = candidates[0]
+                ? configured.find((model) => model.key === candidates[0]!.key)
+                : undefined;
+            if (primaryModel) {
+                for (const rankedModel of ranked) {
+                    if (candidates.length >= 3) break;
+                    if (rankedModel.model.id === primaryModel.id && rankedModel.model.provider !== primaryModel.provider) {
+                        addRankedCandidate(rankedModel);
+                    }
+                }
+            }
+            for (const rankedModel of ranked) {
+                if (candidates.length >= 3) break;
+                addRankedCandidate(rankedModel);
             }
         }
 
